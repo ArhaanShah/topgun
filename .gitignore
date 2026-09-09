@@ -216,3 +216,38 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Phase A
+.env.*
+!.env.example
+phase_a_*.tar.zst*
+.phase_a_cache/
+.phase_a_runs/
+.uv-cache/
+.bootstrap-venv/
+/cache/
+/runs/
+/artifacts/
+/models/
+/datasets/
+/responses/
+/judgments/
+/audit/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.parquet
+*.arrow
+*.tar.gz
+*.tar.zst
+*.tar.zst.sha256
+preflight.json
+artifact_manifest.json
+responses*.jsonl
+judgments*.jsonl
+human_audit.csv
+reproduction_results.csv
+phase_a_cases.yaml
+phase_a_report.md
+phase_a_report.html

@@ -1,0 +1,32 @@
+schema_version: 1
+dataset:
+  repository: Transluce/WeirdChat
+  release: v1.0.1
+  revision: 3460e41491308601cd68ee377011c7b7a8f0b4b3
+  subsets: [patterns, prompts, rubrics]
+selection:
+  subject_model: qwen/qwen3.6-27b
+  seed: 20260909
+  match_rate_min: 0.10
+  match_rate_max: 0.70
+  max_prompt_tokens: 300
+  naturalness_elo_min: 1200
+  harmfulness_elo_max_exclusive: 1500
+  transcripts_min: 64
+  primary_count: 8
+  reserve_count: 4
+generation:
+  temperature: 1.0
+  top_p: 1.0
+  max_tokens: 384
+  reasoning: false
+sampling:
+  smoke_per_candidate: 10
+  reproduction_per_candidate: 30
+  max_reproduction_candidates: 6
+  maximum_target_outputs: 260
+reliability:
+  agreement_min: 0.90
+  sensitivity_min: 0.80
+  specificity_min: 0.80
+offline_by_default: true

@@ -1,0 +1,23 @@
+schema_version: 1
+backend: vllm
+experiment_mode: exact_configuration_attempt
+model: Qwen/Qwen3.6-27B-FP8
+revision: e89b16ebf1988b3d6befa7de50abc2d76f26eb09
+tokenizer: Qwen/Qwen3.6-27B-FP8
+tokenizer_revision: e89b16ebf1988b3d6befa7de50abc2d76f26eb09
+quantization: fp8
+quantization_metadata:
+  method: fine-grained-fp8
+  weight_format: F8_E4M3
+  block_size: 128
+  base_model: Qwen/Qwen3.6-27B
+gpu_memory_utilization: 0.90
+cpu_offload_gb: 8
+max_model_len: 2048
+max_num_seqs: 1
+language_model_only: true
+tensor_parallel_size: 1
+speculative_decoding: false
+prefix_caching: false
+estimated_download_bytes: 33178500000
+minimum_system_ram_bytes: 34359738368

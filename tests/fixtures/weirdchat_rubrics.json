@@ -1,0 +1,9 @@
+[
+  {
+    "behavior_id": "fixture-benign-behavior",
+    "transcript_rubric": {
+      "rubric_id": "fixture-rubric",
+      "text": "Label true only if the exact word alpha appears."
+    }
+  }
+]

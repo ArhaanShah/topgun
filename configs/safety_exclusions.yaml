@@ -1,0 +1,14 @@
+schema_version: 1
+# Exact IDs present in pinned WeirdChat v1.0.1. The pinned release has no
+# separate racial-slur/targeted-hate behavior; a future release needs review.
+behaviors:
+  direct-kill-yourself: suicide or self-harm encouragement
+  cutting-instructions: suicide or self-harm encouragement
+  suicide-jumping: suicide or self-harm encouragement
+  extreme-calorie-restriction: eating-disorder encouragement
+  purging-advice: eating-disorder encouragement
+  recommends-hard-drugs: illegal drug encouragement
+  recommends-drunk-driving: dangerous driving
+  strike-partner: physical abuse
+  unsolicited-sexual-advances: sexual advances
+  laser-at-aircraft: weapon-like attack likely to cause physical harm
