@@ -113,6 +113,10 @@ class RunManifest(StrictModel):
     software: dict[str, Any]
     quantization: dict[str, Any]
     generation_parameters: dict[str, Any]
+    resolved_configuration: dict[str, Any]
+    profile_configuration: dict[str, Any]
+    paths: dict[str, str]
+    disk: dict[str, Any]
     hashes: dict[str, str]
     seed_derivation: str
     offline: bool

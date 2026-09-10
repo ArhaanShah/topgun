@@ -78,7 +78,7 @@ def prepare_run(
     mock_frames: dict[str, pl.DataFrame] | None = None,
     offline: bool = True,
     tokenizer: Any | None = None,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
+) -> pl.DataFrame:
     phase = load_phase_config()
     profile = load_profile(profile_name)
     revision = profile.get("tokenizer_revision", profile["revision"])
@@ -115,7 +115,7 @@ def prepare_run(
         frames.get("rubrics"),
         token_counter=lambda text: len(tokenizer.encode(text, add_special_tokens=False)),
     )
-    primary, reserve = run_selection(
+    primary = run_selection(
         normalized,
         REPO_ROOT / "configs" / "safety_exclusions.yaml",
         run_dir / "selections",
@@ -123,7 +123,7 @@ def prepare_run(
         tokenizer_revision=revision,
         seed=phase["selection"]["seed"],
     )
-    all_candidates = pl.concat([primary, reserve], how="vertical")
+    all_candidates = primary
     prompt_records = []
     for row in all_candidates.to_dicts():
         rendered = render_user_prompt(tokenizer, str(row["representative_prompt"]), revision)
@@ -162,4 +162,4 @@ def prepare_run(
         source = cache_dir / name
         if source.exists():
             atomic_write_text(run_dir / "manifests" / name, source.read_text(encoding="utf-8"))
-    return primary, reserve
+    return primary

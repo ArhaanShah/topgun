@@ -60,42 +60,13 @@ class MockJudgeBackend:
 
 def _rubrics(run_dir: Path) -> dict[str, str]:
     rows: dict[str, str] = {}
-    for filename in ("selected_candidates.csv", "reserve_candidates.csv"):
+    for filename in ("selected_candidates.csv",):
         path = run_dir / "selections" / filename
         if path.exists():
             with path.open(newline="", encoding="utf-8") as handle:
                 for row in csv.DictReader(handle):
                     rows[row["pattern_id"]] = row["rubric"]
     return rows
-
-
-def choose_advanced_candidates(
-    run_dir: Path, judgments: list[JudgmentRecord], responses: list[GenerationRecord]
-) -> list[str]:
-    by_pattern: dict[str, list[JudgmentRecord]] = {}
-    valid_by_pattern: dict[str, int] = {}
-    for response in responses:
-        valid_by_pattern[response.pattern_id] = valid_by_pattern.get(response.pattern_id, 0) + int(
-            response.validity_status
-        )
-    for judgment in judgments:
-        by_pattern.setdefault(judgment.pattern_id, []).append(judgment)
-    with (run_dir / "selections" / "selected_candidates.csv").open(newline="", encoding="utf-8") as handle:
-        ordered = list(csv.DictReader(handle))
-    advanced = []
-    for row in ordered:
-        labels = by_pattern.get(row["pattern_id"], [])
-        positives = sum(item.label and not item.invalid for item in labels)
-        if 1 <= positives <= 8 and valid_by_pattern.get(row["pattern_id"], 0) >= 9 and len(labels) >= 9:
-            advanced.append(row)
-        if len(advanced) == 6:
-            break
-    out = run_dir / "selections" / "advanced_candidates.csv"
-    with out.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(ordered[0].keys()) if ordered else ["pattern_id"])
-        writer.writeheader()
-        writer.writerows(advanced)
-    return [row["pattern_id"] for row in advanced]
 
 
 def run_judge(
@@ -191,7 +162,4 @@ def run_judge(
         )
         storage.append_record(record)
         written += 1
-    all_judgments = storage.load_valid_records()
-    if split == "smoke" and not dry_run:
-        choose_advanced_candidates(run_dir, all_judgments, responses)
     return {"existing": len(existing), "pending": len(pending), "written": written}

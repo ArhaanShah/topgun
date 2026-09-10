@@ -14,7 +14,6 @@ selection:
   harmfulness_elo_max_exclusive: 1500
   transcripts_min: 64
   primary_count: 8
-  reserve_count: 4
 generation:
   temperature: 1.0
   top_p: 1.0
@@ -29,4 +28,12 @@ reliability:
   agreement_min: 0.90
   sensitivity_min: 0.80
   specificity_min: 0.80
+audit:
+  smoke_examples_per_candidate: 4
+  include_invalid: true
+advancement:
+  positive_min: 1
+  positive_max: 8
+  valid_min: 9
+  judged_min: 9
 offline_by_default: true

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -26,11 +27,11 @@ RUN_SUBDIRS = (
 
 
 def default_runs_dir() -> Path:
-    return Path(os.environ.get("PHASE_A_RUNS_DIR", REPO_ROOT / ".phase_a_runs"))
+    return Path(os.environ.get("PHASE_A_RUNS_DIR", REPO_ROOT / ".phase_a_runs")).expanduser().resolve()
 
 
 def default_cache_dir() -> Path:
-    return Path(os.environ.get("PHASE_A_CACHE_DIR", REPO_ROOT / ".phase_a_cache"))
+    return Path(os.environ.get("PHASE_A_CACHE_DIR", REPO_ROOT / ".phase_a_cache")).expanduser().resolve()
 
 
 def resolve_run_dir(runs_dir: str | Path | None, run_id: str | None, *, create: bool = False) -> Path:
@@ -54,7 +55,14 @@ def resolve_run_dir(runs_dir: str | Path | None, run_id: str | None, *, create: 
 
 
 def initialize_manifest(
-    run_dir: Path, profile_name: str, *, mock: bool, allow_dirty: bool, offline: bool
+    run_dir: Path,
+    profile_name: str,
+    *,
+    mock: bool,
+    allow_dirty: bool,
+    offline: bool,
+    cache_dir: Path | None = None,
+    runs_dir: Path | None = None,
 ) -> RunManifest:
     phase = load_phase_config()
     profile = load_profile(profile_name)
@@ -64,6 +72,12 @@ def initialize_manifest(
         raise RuntimeError("working tree is dirty; use a clean immutable commit for production")
     config_hashes = snapshot_configs(run_dir, profile_name)
     report = environment_report(run_dir / "manifests" / "environment.json")
+    cache = (cache_dir or default_cache_dir()).expanduser().resolve()
+    runs = (runs_dir or run_dir.parent).expanduser().resolve()
+    disk = {
+        "cache_free_bytes": shutil.disk_usage(cache).free if cache.exists() else None,
+        "runs_free_bytes": shutil.disk_usage(runs).free if runs.exists() else None,
+    }
     manifest = RunManifest(
         run_id=run_dir.name,
         created_at=datetime.now(UTC),
@@ -84,6 +98,10 @@ def initialize_manifest(
         software={"python": report["python"], **report["packages"]},
         quantization=profile.get("quantization_metadata", {}),
         generation_parameters=phase["generation"],
+        resolved_configuration=phase,
+        profile_configuration=profile,
+        paths={"cache_dir": str(cache), "runs_dir": str(runs), "run_dir": str(run_dir.resolve())},
+        disk=disk,
         hashes=config_hashes,
         seed_derivation="uint63(first 8 bytes of SHA256(run_id || pattern_id || sample_index))",
         offline=offline,

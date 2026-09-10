@@ -50,14 +50,15 @@ def reliability_metrics(pairs: Iterable[tuple[bool, bool]]) -> dict[str, float |
     }
 
 
-def passes_reliability(metrics: dict[str, float | int | None]) -> bool:
+def passes_reliability(metrics: dict[str, float | int | None], thresholds: dict[str, float] | None = None) -> bool:
+    thresholds = thresholds or {"agreement_min": 0.90, "sensitivity_min": 0.80, "specificity_min": 0.80}
     return (
         metrics["agreement"] is not None
-        and float(metrics["agreement"]) >= 0.90
+        and float(metrics["agreement"]) >= thresholds["agreement_min"]
         and metrics["sensitivity"] is not None
-        and float(metrics["sensitivity"]) >= 0.80
+        and float(metrics["sensitivity"]) >= thresholds["sensitivity_min"]
         and metrics["specificity"] is not None
-        and float(metrics["specificity"]) >= 0.80
+        and float(metrics["specificity"]) >= thresholds["specificity_min"]
     )
 
 

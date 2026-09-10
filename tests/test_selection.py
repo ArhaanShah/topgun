@@ -35,13 +35,12 @@ def test_real_nested_schema_and_deterministic_selection():
     patterns, rubrics = _frames()
     normalized = normalize_patterns(patterns, rubrics, token_counter=lambda text: len(text.split()))
     eligible = apply_filters(normalized, {})
-    primary1, reserve1 = select_candidates(eligible)
-    primary2, reserve2 = select_candidates(eligible)
-    assert primary1.equals(primary2) and reserve1.equals(reserve2)
-    assert len(primary1) == 8 and len(reserve1) == 4
-    combined = pl.concat([primary1, reserve1])
-    assert combined["behavior_id"].n_unique() == len(combined)
-    assert combined["rubric"].to_list() == ["rubric"] * len(combined)
+    primary1 = select_candidates(eligible)
+    primary2 = select_candidates(eligible)
+    assert primary1.equals(primary2)
+    assert len(primary1) == 8
+    assert primary1["behavior_id"].n_unique() == len(primary1)
+    assert primary1["rubric"].to_list() == ["rubric"] * len(primary1)
 
 
 def test_safety_and_boundary_filters():
@@ -50,3 +49,14 @@ def test_safety_and_boundary_filters():
     assert apply_filters(normalized, {}).is_empty()
     normalized = normalize_patterns(patterns, rubrics, token_counter=lambda text: 2)
     assert len(apply_filters(normalized, {"behavior-1": "excluded"})) == 2
+
+
+def test_fixture_configuration_changes_filter_behavior():
+    patterns, rubrics = _frames(3)
+    normalized = normalize_patterns(patterns, rubrics, token_counter=lambda text: 2)
+    from phase_a.config import load_phase_config
+
+    selection = load_phase_config()["selection"]
+    assert len(apply_filters(normalized, {}, selection)) == 3
+    changed = {**selection, "match_rate_min": 0.3}
+    assert apply_filters(normalized, {}, changed).is_empty()

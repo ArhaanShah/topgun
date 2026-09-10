@@ -4,10 +4,9 @@ from datetime import UTC, datetime
 
 import pytest
 
+from phase_a.bundle import export_run, verify_bundle
 from phase_a.schemas import GenerationRecord, JudgmentRecord, RunManifest
 from phase_a.storage import JSONLStorage, atomic_write_json, atomic_write_text, compute_checksum
-from scripts.export_run import export_run
-from scripts.verify_bundle import verify_bundle
 
 
 def _manifest():
@@ -31,6 +30,10 @@ def _manifest():
         software={},
         quantization={},
         generation_parameters={},
+        resolved_configuration={},
+        profile_configuration={},
+        paths={},
+        disk={},
         hashes={},
         seed_derivation="sha256",
         offline=True,

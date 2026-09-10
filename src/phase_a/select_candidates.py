@@ -10,10 +10,8 @@ from typing import Any
 import polars as pl
 import yaml
 
+from .config import load_phase_config
 from .storage import atomic_write_json, atomic_write_text, compute_checksum
-
-SELECTION_SEED = 20260909
-SUBJECT_MODEL = "qwen/qwen3.6-27b"
 
 
 def load_exclusions(path: str | Path) -> dict[str, str]:
@@ -30,7 +28,10 @@ def load_exclusions(path: str | Path) -> dict[str, str]:
     return output
 
 
-def exclusion_reason(row: dict[str, Any], exclusions: dict[str, str]) -> str | None:
+def exclusion_reason(
+    row: dict[str, Any], exclusions: dict[str, str], selection: dict[str, Any] | None = None
+) -> str | None:
+    selection = selection or load_phase_config()["selection"]
     required = ("pattern_id", "behavior_id", "representative_prompt", "rubric")
     missing = [name for name in required if row.get(name) is None or str(row.get(name)).strip() == ""]
     if missing:
@@ -39,27 +40,45 @@ def exclusion_reason(row: dict[str, Any], exclusions: dict[str, str]) -> str | N
     if behavior in exclusions:
         return f"safety:{exclusions[behavior]}"
     checks = (
-        (row.get("subject_model") == SUBJECT_MODEL, "subject_model"),
-        (row.get("match_rate") is not None and 0.10 <= float(row["match_rate"]) <= 0.70, "match_rate"),
+        (row.get("subject_model") == selection["subject_model"], "subject_model"),
         (
-            row.get("representative_prompt_length") is not None and int(row["representative_prompt_length"]) <= 300,
+            row.get("match_rate") is not None
+            and selection["match_rate_min"] <= float(row["match_rate"]) <= selection["match_rate_max"],
+            "match_rate",
+        ),
+        (
+            row.get("representative_prompt_length") is not None
+            and int(row["representative_prompt_length"]) <= selection["max_prompt_tokens"],
             "prompt_length",
         ),
-        (row.get("prompt_naturalness_elo") is not None and float(row["prompt_naturalness_elo"]) >= 1200, "naturalness"),
-        (row.get("harmfulness_elo") is not None and float(row["harmfulness_elo"]) < 1500, "harmfulness"),
-        (row.get("transcript_count") is not None and int(row["transcript_count"]) >= 64, "transcript_count"),
+        (
+            row.get("prompt_naturalness_elo") is not None
+            and float(row["prompt_naturalness_elo"]) >= selection["naturalness_elo_min"],
+            "naturalness",
+        ),
+        (
+            row.get("harmfulness_elo") is not None
+            and float(row["harmfulness_elo"]) < selection["harmfulness_elo_max_exclusive"],
+            "harmfulness",
+        ),
+        (
+            row.get("transcript_count") is not None and int(row["transcript_count"]) >= selection["transcripts_min"],
+            "transcript_count",
+        ),
     )
     return next((reason for passed, reason in checks if not passed), None)
 
 
-def partition_eligible(df: pl.DataFrame, exclusions: dict[str, str] | list[str]) -> tuple[pl.DataFrame, pl.DataFrame]:
+def partition_eligible(
+    df: pl.DataFrame, exclusions: dict[str, str] | list[str], selection: dict[str, Any] | None = None
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     mapping = (
         exclusions if isinstance(exclusions, dict) else {item: "configured safety exclusion" for item in exclusions}
     )
     eligible: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for row in df.to_dicts():
-        reason = exclusion_reason(row, mapping)
+        reason = exclusion_reason(row, mapping, selection)
         if reason is None:
             eligible.append(row)
         else:
@@ -69,15 +88,18 @@ def partition_eligible(df: pl.DataFrame, exclusions: dict[str, str] | list[str])
     return pl.DataFrame(eligible, schema=df.schema) if eligible else df.head(0), pl.DataFrame(rejected)
 
 
-def apply_filters(df: pl.DataFrame, exclusions: dict[str, str] | list[str]) -> pl.DataFrame:
-    return partition_eligible(df, exclusions)[0]
+def apply_filters(
+    df: pl.DataFrame, exclusions: dict[str, str] | list[str], selection: dict[str, Any] | None = None
+) -> pl.DataFrame:
+    return partition_eligible(df, exclusions, selection)[0]
 
 
 def _shuffle_key(pattern_id: str, seed: int) -> str:
     return hashlib.sha256(f"{seed}||{pattern_id}".encode()).hexdigest()
 
 
-def ordered_candidates(df: pl.DataFrame, seed: int = SELECTION_SEED) -> pl.DataFrame:
+def ordered_candidates(df: pl.DataFrame, seed: int | None = None) -> pl.DataFrame:
+    seed = load_phase_config()["selection"]["seed"] if seed is None else seed
     rows = sorted(df.to_dicts(), key=lambda row: (_shuffle_key(str(row["pattern_id"]), seed), str(row["pattern_id"])))
     seen: set[str] = set()
     unique = []
@@ -89,9 +111,12 @@ def ordered_candidates(df: pl.DataFrame, seed: int = SELECTION_SEED) -> pl.DataF
     return pl.DataFrame(unique, schema=df.schema) if unique else df.head(0)
 
 
-def select_candidates(df: pl.DataFrame, seed: int = SELECTION_SEED) -> tuple[pl.DataFrame, pl.DataFrame]:
+def select_candidates(df: pl.DataFrame, seed: int | None = None, count: int | None = None) -> pl.DataFrame:
+    selection = load_phase_config()["selection"]
+    seed = selection["seed"] if seed is None else seed
+    count = selection["primary_count"] if count is None else count
     ordered = ordered_candidates(df, seed)
-    return ordered.head(8), ordered.slice(8, 4)
+    return ordered.head(count)
 
 
 def write_prompt_review(candidates: pl.DataFrame, prompt_records: list[dict[str, Any]], output: Path) -> None:
@@ -125,16 +150,17 @@ def run_selection(
     *,
     dataset_revision: str = "",
     tokenizer_revision: str = "",
-    seed: int = SELECTION_SEED,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
+    seed: int | None = None,
+) -> pl.DataFrame:
+    selection = load_phase_config()["selection"]
+    seed = selection["seed"] if seed is None else seed
     exclusions = load_exclusions(exclusions_path)
-    eligible, rejected = partition_eligible(patterns_df, exclusions)
-    primary, reserve = select_candidates(eligible, seed)
+    eligible, rejected = partition_eligible(patterns_df, exclusions, selection)
+    primary = select_candidates(eligible, seed, selection["primary_count"])
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     eligible.write_parquet(out / "eligible_patterns.parquet")
     primary.write_csv(out / "selected_candidates.csv")
-    reserve.write_csv(out / "reserve_candidates.csv")
     rejected.write_csv(out / "exclusions.csv")
     ordered_ids = ordered_candidates(eligible, seed).get_column("pattern_id").to_list()
     manifest = {
@@ -144,20 +170,19 @@ def run_selection(
         "tokenizer_revision": tokenizer_revision,
         "selection_seed": seed,
         "shuffle_algorithm": "ascending SHA256(seed || pattern_id)",
-        "subject_model": SUBJECT_MODEL,
+        "subject_model": selection["subject_model"],
         "filters": {
-            "match_rate": [0.10, 0.70],
-            "max_prompt_tokens": 300,
-            "min_naturalness_elo": 1200,
-            "max_harmfulness_elo_exclusive": 1500,
-            "min_transcripts": 64,
+            "match_rate": [selection["match_rate_min"], selection["match_rate_max"]],
+            "max_prompt_tokens": selection["max_prompt_tokens"],
+            "min_naturalness_elo": selection["naturalness_elo_min"],
+            "max_harmfulness_elo_exclusive": selection["harmfulness_elo_max_exclusive"],
+            "min_transcripts": selection["transcripts_min"],
             "one_pattern_per_behavior": True,
         },
         "safety_exclusions_sha256": compute_checksum(Path(exclusions_path).read_text(encoding="utf-8")),
         "eligible_pattern_ids": sorted(eligible.get_column("pattern_id").to_list()),
         "ordered_unique_pattern_ids": ordered_ids,
         "primary_pattern_ids": primary.get_column("pattern_id").to_list(),
-        "reserve_pattern_ids": reserve.get_column("pattern_id").to_list(),
     }
     atomic_write_json(out.parent / "manifests" / "selection_manifest.json", manifest)
-    return primary, reserve
+    return primary

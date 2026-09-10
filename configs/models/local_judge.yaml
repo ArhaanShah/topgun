@@ -20,3 +20,4 @@ language_model_only: true
 max_tokens: 512
 temperature: 0.0
 top_p: 1.0
+estimated_download_bytes: 6442450944

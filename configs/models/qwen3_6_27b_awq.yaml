@@ -17,7 +17,7 @@ quantization_metadata:
   repository_owner: QuantTrio
   base_model: Qwen/Qwen3.6-27B
 gpu_memory_utilization: 0.90
-cpu_offload_gb: 0
+cpu_offload_gb: 4
 max_model_len: 2048
 max_num_seqs: 1
 language_model_only: true

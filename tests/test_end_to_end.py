@@ -5,14 +5,13 @@ import csv
 import yaml
 
 from phase_a.audit import create_audit_package
+from phase_a.bundle import export_run, verify_bundle
 from phase_a.finalize import finalize_run
-from phase_a.generate import run_generation
+from phase_a.generate import run_canary, run_generation
 from phase_a.judge import run_judge
 from phase_a.prepare import build_mock_frames, prepare_run
 from phase_a.run import initialize_manifest, resolve_run_dir
 from phase_a.smoke_test import run_health_check
-from scripts.export_run import export_run
-from scripts.verify_bundle import verify_bundle
 
 
 def test_tiny_mock_pipeline_through_verified_export(tmp_path, monkeypatch):
@@ -21,7 +20,8 @@ def test_tiny_mock_pipeline_through_verified_export(tmp_path, monkeypatch):
     initialize_manifest(run, "fp8_offload", mock=True, allow_dirty=True, offline=True)
     prepare_run(run, "fp8_offload", cache, mock_frames=build_mock_frames())
     assert run_health_check(run, "fp8_offload", mock=True)["status"] == "PASS"
-    run_generation(run, "smoke", profile_name="fp8_offload", mock=True, limit=2)
+    assert run_canary(run, profile_name="fp8_offload", mock=True)["status"] == "PASS"
+    run_generation(run, "smoke", profile_name="fp8_offload", mock=True, limit=1, resume=True)
     run_judge(run, "smoke", mock=True, limit=2)
 
     selected_path = run / "selections" / "selected_candidates.csv"
@@ -32,6 +32,9 @@ def test_tiny_mock_pipeline_through_verified_export(tmp_path, monkeypatch):
         writer = csv.DictWriter(handle, fieldnames=list(first))
         writer.writeheader()
         writer.writerow(first)
+    from phase_a.storage import atomic_write_json
+
+    atomic_write_json(run / "manifests" / "smoke_audit_gate.json", {"status": "PASS"})
 
     from phase_a import generate
 

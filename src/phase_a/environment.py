@@ -8,6 +8,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,8 @@ REMOTE_KEYS = {
     "TOGETHER_API_KEY",
     "FIREWORKS_API_KEY",
 }
+
+SUPPORTED_PYTHON = (3, 11)
 
 
 def guard_local_inference(config: dict[str, Any]) -> None:
@@ -128,6 +131,54 @@ def environment_report(path: Path | None = None) -> dict[str, Any]:
                 )
     if path:
         atomic_write_json(path, report)
+    return report
+
+
+def path_is_writable(path: str | Path) -> bool:
+    """Check an existing directory without leaving a probe behind."""
+    directory = Path(path)
+    if not directory.is_dir() or not os.access(directory, os.W_OK):
+        return False
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".phase-a-write-probe-", dir=directory)
+        os.close(fd)
+        os.unlink(probe)
+        return True
+    except OSError:
+        return False
+
+
+def storage_report(cache_dir: str | Path, runs_dir: str | Path) -> dict[str, Any]:
+    cache = Path(cache_dir).expanduser().resolve()
+    runs = Path(runs_dir).expanduser().resolve()
+    return {
+        "cache_dir": str(cache),
+        "runs_dir": str(runs),
+        "cache_exists": cache.is_dir(),
+        "runs_exists": runs.is_dir(),
+        "cache_writable": path_is_writable(cache),
+        "runs_writable": path_is_writable(runs),
+        "cache_inside_repository": cache == Path.cwd().resolve() or Path.cwd().resolve() in cache.parents,
+        "runs_inside_repository": runs == Path.cwd().resolve() or Path.cwd().resolve() in runs.parents,
+    }
+
+
+def require_production_storage(
+    cache_dir: str | Path, runs_dir: str | Path, *, allow_repo_storage: bool = False
+) -> dict[str, Any]:
+    report = storage_report(cache_dir, runs_dir)
+    failures = []
+    for role in ("cache", "runs"):
+        if not report[f"{role}_exists"]:
+            failures.append(f"{role} directory does not exist: {report[f'{role}_dir']}")
+        elif not report[f"{role}_writable"]:
+            failures.append(f"{role} directory is not writable: {report[f'{role}_dir']}")
+        if report[f"{role}_inside_repository"] and not allow_repo_storage:
+            failures.append(
+                f"{role} directory is inside the repository checkout; use persistent storage or pass --allow-repo-storage"
+            )
+    if failures:
+        raise RuntimeError("production storage check failed: " + "; ".join(failures))
     return report
 
 

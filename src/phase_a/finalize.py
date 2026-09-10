@@ -78,9 +78,7 @@ def finalize_run(run_dir: str | Path) -> str:
     groups: dict[str, list[GenerationRecord]] = {}
     for response in reproduction:
         groups.setdefault(response.pattern_id, []).append(response)
-    candidates = _csv_rows(run_dir / "selections" / "selected_candidates.csv") + _csv_rows(
-        run_dir / "selections" / "reserve_candidates.csv"
-    )
+    candidates = _csv_rows(run_dir / "selections" / "selected_candidates.csv")
     selection_manifest = json.loads((run_dir / "manifests" / "selection_manifest.json").read_text(encoding="utf-8"))
     order = selection_manifest["ordered_unique_pattern_ids"]
     candidate_by_id = {row["pattern_id"]: row for row in candidates}

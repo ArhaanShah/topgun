@@ -8,8 +8,11 @@ import html
 import random
 from pathlib import Path
 
+from .config import load_phase_config
+from .run import load_manifest
 from .schemas import AuditLabel, GenerationRecord, JudgmentRecord
-from .storage import JSONLStorage, atomic_write_text
+from .statistics import passes_reliability, reliability_metrics
+from .storage import JSONLStorage, atomic_write_json, atomic_write_text
 
 AUDIT_FIELDS = [
     "run_id",
@@ -28,7 +31,7 @@ AUDIT_FIELDS = [
 
 def _load_rubrics(run_dir: Path) -> dict[str, str]:
     output = {}
-    for name in ("selected_candidates.csv", "reserve_candidates.csv"):
+    for name in ("selected_candidates.csv",):
         path = run_dir / "selections" / name
         if path.exists():
             with path.open(newline="", encoding="utf-8") as handle:
@@ -39,8 +42,10 @@ def _load_rubrics(run_dir: Path) -> dict[str, str]:
 def select_audit_rows(
     responses: list[GenerationRecord],
     judgments: list[JudgmentRecord],
-    seed: int = 20260909,
+    seed: int | None = None,
 ) -> list[GenerationRecord]:
+    phase = load_phase_config()
+    seed = phase["selection"]["seed"] if seed is None else seed
     judgment_by_id = {(j.split, j.pattern_id, j.sample_index): j for j in judgments}
     chosen: dict[tuple[str, str, int], GenerationRecord] = {}
     groups: dict[tuple[str, str], list[GenerationRecord]] = {}
@@ -50,7 +55,7 @@ def select_audit_rows(
         if not response.validity_status or judgment is None or judgment.invalid:
             chosen[(response.split, response.pattern_id, response.sample_index)] = response
     for (split, pattern), group in sorted(groups.items()):
-        count = 4 if split == "smoke" else 8
+        count = phase["audit"]["smoke_examples_per_candidate"] if split == "smoke" else 8
         rng = random.Random(int.from_bytes(hashlib.sha256(f"{seed}||{split}||{pattern}".encode()).digest()[:8], "big"))
         positives = [
             r
@@ -74,14 +79,13 @@ def select_audit_rows(
 
 def create_audit_package(run_dir: str | Path) -> Path:
     run_dir = Path(run_dir)
-    responses, judgments = [], []
-    for split in ("smoke", "reproduction"):
-        responses.extend(
-            JSONLStorage(run_dir / "responses" / f"responses_{split}.jsonl", GenerationRecord).load_valid_records()
-        )
-        judgments.extend(
-            JSONLStorage(run_dir / "judgments" / f"judgments_{split}.jsonl", JudgmentRecord).load_valid_records()
-        )
+    manifest = load_manifest(run_dir)
+    phase = manifest.resolved_configuration
+    responses = JSONLStorage(run_dir / "responses" / "responses_smoke.jsonl", GenerationRecord).load_valid_records()
+    judgments = JSONLStorage(run_dir / "judgments" / "judgments_smoke.jsonl", JudgmentRecord).load_valid_records()
+    expected = phase["selection"]["primary_count"] * phase["sampling"]["smoke_per_candidate"]
+    if manifest.experiment_mode != "mock" and (len(responses) != expected or len(judgments) != expected):
+        raise RuntimeError(f"smoke audit requires exactly {expected} responses and {expected} judgments")
     rows = select_audit_rows(responses, judgments)
     rubrics = _load_rubrics(run_dir)
     audit_dir = run_dir / "audit"
@@ -125,6 +129,111 @@ For each row, read only the rubric, user context, and response. Enter `true` or 
         + "".join(sections),
     )
     return audit_dir
+
+
+def _write_manual_smoke_sheet(
+    run_dir: Path,
+    responses: list[GenerationRecord],
+    rubrics: dict[str, str],
+    supplied: dict[tuple[str, str, str], dict[str, str]],
+) -> None:
+    path = run_dir / "audit" / "manual_label_required.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=AUDIT_FIELDS)
+        writer.writeheader()
+        for response in sorted(responses, key=lambda item: (item.pattern_id, item.sample_index)):
+            key = (response.split, response.pattern_id, str(response.sample_index))
+            existing = supplied.get(key, {})
+            writer.writerow(
+                {
+                    "run_id": response.run_id,
+                    "split": response.split,
+                    "pattern_id": response.pattern_id,
+                    "behavior_id": response.behavior_id,
+                    "sample_index": response.sample_index,
+                    "rubric": rubrics[response.pattern_id],
+                    "user_context": response.raw_user_prompt,
+                    "response_text": response.response_text,
+                    "human_label": existing.get("human_label", ""),
+                    "ambiguity_flag": existing.get("ambiguity_flag", ""),
+                    "notes": existing.get("notes", ""),
+                }
+            )
+
+
+def evaluate_smoke_audit(run_dir: str | Path) -> dict[str, object]:
+    """Persist the human-reliability gate and select reproduction candidates only after it passes."""
+    run_dir = Path(run_dir)
+    manifest = load_manifest(run_dir)
+    phase = manifest.resolved_configuration
+    responses = JSONLStorage(run_dir / "responses" / "responses_smoke.jsonl", GenerationRecord).load_valid_records()
+    judgments = JSONLStorage(run_dir / "judgments" / "judgments_smoke.jsonl", JudgmentRecord).load_valid_records()
+    with (run_dir / "audit" / "human_audit.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    supplied = {(row["split"], row["pattern_id"], row["sample_index"]): row for row in rows}
+    human = {key: label for key, row in supplied.items() if (label := _parse_bool(row.get("human_label"))) is not None}
+    auto = {(item.split, item.pattern_id, item.sample_index): item for item in judgments}
+    pairs = []
+    for key, label in human.items():
+        normalized = (key[0], key[1], int(key[2]))
+        if normalized in auto and not auto[normalized].invalid:
+            pairs.append((auto[normalized].label, label))
+    metrics = reliability_metrics(pairs)
+    reliable = passes_reliability(metrics, phase["reliability"])
+    all_human = len(responses) > 0 and all(
+        (response.split, response.pattern_id, str(response.sample_index)) in human for response in responses
+    )
+    passed = reliable or all_human
+    advanced_ids: list[str] = []
+    if passed:
+        with (run_dir / "selections" / "selected_candidates.csv").open(newline="", encoding="utf-8") as handle:
+            candidates = list(csv.DictReader(handle))
+        advancement = phase["advancement"]
+        for candidate in candidates:
+            group = [response for response in responses if response.pattern_id == candidate["pattern_id"]]
+            labels = []
+            judged = 0
+            for response in group:
+                key = (response.split, response.pattern_id, response.sample_index)
+                text_key = (response.split, response.pattern_id, str(response.sample_index))
+                if text_key in human:
+                    labels.append(human[text_key])
+                    judged += 1
+                elif reliable and key in auto and not auto[key].invalid:
+                    labels.append(auto[key].label)
+                    judged += 1
+            positives = sum(labels)
+            valid = sum(response.validity_status for response in group)
+            if (
+                advancement["positive_min"] <= positives <= advancement["positive_max"]
+                and valid >= advancement["valid_min"]
+                and judged >= advancement["judged_min"]
+            ):
+                advanced_ids.append(candidate["pattern_id"])
+            if len(advanced_ids) == phase["sampling"]["max_reproduction_candidates"]:
+                break
+        advanced = [candidate for candidate in candidates if candidate["pattern_id"] in advanced_ids]
+        path = run_dir / "selections" / "advanced_candidates.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(candidates[0]) if candidates else ["pattern_id"])
+            writer.writeheader()
+            writer.writerows(advanced)
+    else:
+        _write_manual_smoke_sheet(run_dir, responses, _load_rubrics(run_dir), supplied)
+    report: dict[str, object] = {
+        "status": "PASS" if passed else "FAIL",
+        "reliability_pass": reliable,
+        "all_smoke_human_labeled": all_human,
+        "metrics": metrics,
+        "advanced_pattern_ids": advanced_ids,
+        "message": (
+            "human smoke-audit gate passed"
+            if passed
+            else "reliability failed; label every row in audit/manual_label_required.csv and import it"
+        ),
+    }
+    atomic_write_json(run_dir / "manifests" / "smoke_audit_gate.json", report)
+    return report
 
 
 def import_labels(run_dir: str | Path, labels_path: str | Path) -> int:
@@ -185,6 +294,7 @@ def import_labels(run_dir: str | Path, labels_path: str | Path) -> int:
         if _parse_bool(completed.get("human_label")) is None:
             raise ValueError("every imported row requires a human_label")
     atomic_write_text(expected_path, labels_path.read_text(encoding="utf-8"))
+    evaluate_smoke_audit(run_dir)
     return len(supplied)
 
 

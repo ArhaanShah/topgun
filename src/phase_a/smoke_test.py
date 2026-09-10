@@ -30,11 +30,17 @@ def run_health_check(
     cache_dir: Path | None = None,
 ) -> dict:
     profile, phase = load_profile(profile_name), load_phase_config()
-    raw_prompts = ["Name one primary color.", "Write one short sentence about rain."]
+    from .run import load_manifest
+
+    manifest = load_manifest(run_dir)
+    if manifest.model_profile != profile_name:
+        raise RuntimeError("profile cannot change inside an existing run; create a new run ID")
+    raw_prompt = "Invent a vivid six-word sentence containing a color, an animal, and a number."
     if dry_run:
-        return {"status": "DRY_RUN", "prompts": len(raw_prompts)}
+        return {"status": "DRY_RUN", "prompts": 1}
+    load_started = time.monotonic()
     if mock:
-        prompts = raw_prompts
+        prompts = [raw_prompt]
         backend = backend or MockBackend()
     else:
         if cache_dir is None:
@@ -43,18 +49,31 @@ def run_health_check(
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
-        prompts = [render_user_prompt(tokenizer, text, profile["revision"]).rendered for text in raw_prompts]
+        prompts = [render_user_prompt(tokenizer, raw_prompt, profile["revision"]).rendered]
         runtime_profile = dict(profile)
         runtime_profile["model"] = runtime_profile["tokenizer"] = str(model_path)
         backend = backend or make_backend(runtime_profile)
-    # Two ordinary prompts, plus the first prompt again with a different seed.
-    prompts.append(prompts[0])
-    seeds = [derive_seed(run_dir.name, "health", i) for i in range(3)]
+    load_time = time.monotonic() - load_started
+    seeds = [derive_seed(run_dir.name, "health", 0)]
+    peak_gpu = None
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except ImportError:
+        pass
     started = time.monotonic()
-    outputs = backend.generate(prompts, seeds, phase["generation"])
+    try:
+        outputs = backend.generate(prompts, seeds, phase["generation"])
+        failure = None
+    except Exception as exc:
+        outputs = []
+        failure = {"type": type(exc).__name__, "message": str(exc)[:1000]}
+    generation_time = time.monotonic() - started
     nonempty = all(item.text.strip() for item in outputs)
-    terminated = all(item.finish_reason in {"stop", "length"} for item in outputs)
-    diverse = outputs[0].text != outputs[2].text
+    terminated = len(outputs) == 1 and all(item.finish_reason in {"stop", "length"} for item in outputs)
+    decodable = len(outputs) == 1 and isinstance(outputs[0].text, str)
     no_reasoning = all("<think>" not in item.text.lower() and "</think>" not in item.text.lower() for item in outputs)
     probe_path = run_dir / "health_resume_probe.jsonl"
     probe = JSONLStorage(probe_path, HealthProbe)
@@ -66,7 +85,6 @@ def run_health_check(
     resumed.append_record(first)
     resumed.append_record(second)
     interruption_resume = len(resumed.load_valid_records()) == 2
-    peak_gpu = None
     try:
         import torch
 
@@ -74,18 +92,35 @@ def run_health_check(
             peak_gpu = torch.cuda.max_memory_allocated()
     except ImportError:
         pass
+    cpu_ram = None
+    try:
+        import psutil
+
+        cpu_ram = psutil.Process().memory_info().rss
+    except ImportError:
+        pass
+    passed = all((failure is None, nonempty, terminated, decodable, no_reasoning, interruption_resume))
     report = {
-        "status": "PASS" if all((nonempty, terminated, diverse, no_reasoning, interruption_resume)) else "FAIL",
+        "status": "PASS" if passed else "FAIL",
         "nonempty": nonempty,
+        "decodable": decodable,
         "valid_termination": terminated,
-        "different_seeds_differ": diverse,
         "reasoning_hidden": no_reasoning,
         "interruption_resume_no_duplicates": interruption_resume,
+        "load_time_seconds": load_time,
+        "generation_time_seconds": generation_time,
         "peak_gpu_memory_bytes": peak_gpu,
+        "cpu_ram_bytes": cpu_ram,
         "cpu_offload_gb": profile.get("cpu_offload_gb", 0),
-        "responses_per_second": len(outputs) / max(time.monotonic() - started, 1e-9),
+        "prompt_tokens": outputs[0].prompt_tokens if outputs else None,
+        "completion_tokens": outputs[0].completion_tokens if outputs else None,
+        "produced_text": outputs[0].text if outputs else "",
+        "sampling_parameters": phase["generation"],
+        "error": failure,
     }
     atomic_write_json(run_dir / "manifests" / "health_check.json", report)
     if report["status"] != "PASS":
-        raise RuntimeError("health check failed; no Phase A samples may be written")
+        raise RuntimeError(
+            "health check failed; stop this run, create a new run ID, and try the pinned awq_4bit profile; never mix profiles"
+        )
     return report

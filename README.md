@@ -30,49 +30,65 @@ Before a production run, commit and push reviewed code, record `git rev-parse HE
 
 ## L4 setup and artifact lock
 
-Set persistent paths when available; otherwise the ignored in-checkout defaults are ephemeral:
-
 ```bash
-export PHASE_A_CACHE_DIR=/persistent/phase-a/cache
-export PHASE_A_RUNS_DIR=/persistent/phase-a/runs
-export HF_HOME=$PHASE_A_CACHE_DIR/huggingface
+git clone https://github.com/ArhaanShah/topgun.git
+cd topgun
+git checkout <GREEN_CI_COMMIT_SHA>
+test -z "$(git status --short)"
+
+nvidia-smi
+free -h
+df -h .
+command -v python3.11
+
+export PHASE_A_ROOT="<VERIFIED_PERSISTENT_DIRECTORY>/phase-a"
+export PHASE_A_CACHE_DIR="$PHASE_A_ROOT/cache"
+export PHASE_A_RUNS_DIR="$PHASE_A_ROOT/runs"
+export HF_HOME="$PHASE_A_CACHE_DIR/huggingface"
+mkdir -p "$PHASE_A_CACHE_DIR" "$PHASE_A_RUNS_DIR"
+
 ./scripts/bootstrap_l4.sh
 make preflight PROFILE=fp8_offload
 make download PROFILE=fp8_offload
 make verify-offline PROFILE=fp8_offload
+
+export RUN_ID="phase-a-$(date -u +%Y%m%dT%H%M%SZ)"
+make prepare PROFILE=fp8_offload RUN_ID="$RUN_ID"
+make health-check PROFILE=fp8_offload RUN_ID="$RUN_ID"
+make canary PROFILE=fp8_offload RUN_ID="$RUN_ID"
 ```
 
-`HF_TOKEN` is optional for public-download rate limits and is never recorded. Preflight runs before the large download and checks L4 identity, RAM, disk, and inference-package availability. If FP8 health checking fails, use `PROFILE=awq_4bit` with a new run ID and start from zero.
+Inspect the canary text, timing, VRAM, and RAM report before continuing. If FP8 health checking fails, use `PROFILE=awq_4bit` with a new run ID and start from zero. Never mix profiles.
 
 ## Production workflow
 
-Choose and reuse a run ID:
+Run the remaining gated commands in their exact required order.
 
 ```bash
-export RUN_ID=phase-a-20260910-01
-make prepare PROFILE=fp8_offload RUN_ID=$RUN_ID
-make health-check PROFILE=fp8_offload RUN_ID=$RUN_ID
-make smoke PROFILE=fp8_offload RUN_ID=$RUN_ID
-make judge-smoke PROFILE=fp8_offload RUN_ID=$RUN_ID
-make reproduce PROFILE=fp8_offload RUN_ID=$RUN_ID
-make judge-reproduction PROFILE=fp8_offload RUN_ID=$RUN_ID
-make export-audit RUN_ID=$RUN_ID
+make smoke PROFILE=fp8_offload RUN_ID="$RUN_ID"
+make judge-smoke PROFILE=fp8_offload RUN_ID="$RUN_ID"
+make export-audit RUN_ID="$RUN_ID"
 ```
 
-All long-running commands support `--dry-run`, `--limit`, `--resume`, `--profile`, `--runs-dir`, and `--cache-dir` through `python -m phase_a.cli`. Each response/judgment is fsynced to an atomic checkpoint before the next request. Resume accepts only schema-valid, checksum-valid sample IDs.
-
-Download the standalone audit directory and complete `human_audit.csv` without consulting automated labels or published rates. Then, on a CPU-only machine:
+Download the standalone audit directory and complete `human_audit.csv` without consulting automated labels or published rates. Then, import the labels to unlock reproduction:
 
 ```bash
-python -m phase_a.audit import-labels --run /path/to/run --labels human_audit_completed.csv
-python -m phase_a.finalize --run /path/to/run
-python scripts/export_run.py /path/to/run
-python scripts/verify_bundle.py /path/to/phase_a_<run_id>.tar.zst
+python -m phase_a.audit import-labels --run "$PHASE_A_RUNS_DIR/$RUN_ID" --labels human_audit_completed.csv
+make reproduce PROFILE=fp8_offload RUN_ID="$RUN_ID"
+make judge-reproduction PROFILE=fp8_offload RUN_ID="$RUN_ID"
+make finalize RUN_ID="$RUN_ID"
+make export-run RUN_ID="$RUN_ID"
+python scripts/verify_bundle.py "$PHASE_A_RUNS_DIR/$RUN_ID/phase_a_${RUN_ID}.tar.zst"
 ```
 
 If reliability fails, finalization writes `audit/manual_label_required.csv`; label every reproduction response for that candidate and import the completed superset before finalizing again. Human labels override automated labels. The final selector takes the first four qualifying candidates in the committed deterministic order, or reports `INSUFFICIENT_REPRODUCIBLE_CASES` without relaxing gates.
 
-Download and verify both the `.tar.zst` archive and `.tar.zst.sha256` before terminating an ephemeral instance. Keep the uncompressed run directory on persistent storage until verification succeeds elsewhere. Do not push raw responses to GitHub.
+Also note:
+- Public Hugging Face downloads and local inference require no paid inference API.
+- Lightning compute/storage may still consume the operator's credits.
+- `HF_TOKEN` is optional and must never be written to a manifest or bundle.
+- Raw responses and model caches must not be committed to GitHub.
+- Before shutting down an ephemeral instance, export the allowlisted run bundle and checksum, download both, and verify the checksum on another machine.
 
 ## Runtime layout
 

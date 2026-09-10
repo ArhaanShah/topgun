@@ -1,10 +1,10 @@
 PROFILE ?= fp8_offload
 RUN_ID ?=
-RUNS_DIR ?= .phase_a_runs
-CACHE_DIR ?= .phase_a_cache
+RUNS_DIR ?= $(if $(PHASE_A_RUNS_DIR),$(PHASE_A_RUNS_DIR),.phase_a_runs)
+CACHE_DIR ?= $(if $(PHASE_A_CACHE_DIR),$(PHASE_A_CACHE_DIR),.phase_a_cache)
 COMMON = --profile $(PROFILE) --runs-dir $(RUNS_DIR) --cache-dir $(CACHE_DIR) --run-id $(RUN_ID)
 
-.PHONY: test check format preflight download verify-offline prepare health-check smoke judge-smoke reproduce judge-reproduction export-audit finalize export-run mock-e2e
+.PHONY: test check format preflight download verify-offline prepare health-check canary smoke judge-smoke reproduce judge-reproduction export-audit finalize export-run mock-e2e
 
 test:
 	python -m pytest -q
@@ -18,19 +18,22 @@ format:
 	python -m ruff format src tests scripts
 
 preflight:
-	python -m phase_a.cli --command preflight --profile $(PROFILE) --cache-dir $(CACHE_DIR)
+	python -m phase_a.cli --command preflight --profile $(PROFILE) --cache-dir $(CACHE_DIR) --runs-dir $(RUNS_DIR)
 
 download:
-	python scripts/download_artifacts.py --profile $(PROFILE) --cache-dir $(CACHE_DIR)
+	python -m phase_a.cli --command download --profile $(PROFILE) --cache-dir $(CACHE_DIR) --runs-dir $(RUNS_DIR)
 
 verify-offline:
-	python scripts/verify_offline.py --profile $(PROFILE) --cache-dir $(CACHE_DIR)
+	python -m phase_a.cli --command verify-offline --profile $(PROFILE) --cache-dir $(CACHE_DIR) --runs-dir $(RUNS_DIR)
 
 prepare:
 	python -m phase_a.cli --command prepare $(COMMON)
 
 health-check:
 	python -m phase_a.cli --command health-check $(COMMON)
+
+canary:
+	python -m phase_a.cli --command canary $(COMMON) --resume
 
 smoke:
 	python -m phase_a.cli --command smoke $(COMMON) --resume
