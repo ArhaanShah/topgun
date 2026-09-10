@@ -83,9 +83,42 @@ def create_audit_package(run_dir: str | Path) -> Path:
     phase = manifest.resolved_configuration
     responses = JSONLStorage(run_dir / "responses" / "responses_smoke.jsonl", GenerationRecord).load_valid_records()
     judgments = JSONLStorage(run_dir / "judgments" / "judgments_smoke.jsonl", JudgmentRecord).load_valid_records()
-    expected = phase["selection"]["primary_count"] * phase["sampling"]["smoke_per_candidate"]
-    if manifest.experiment_mode != "mock" and (len(responses) != expected or len(judgments) != expected):
-        raise RuntimeError(f"smoke audit requires exactly {expected} responses and {expected} judgments")
+    selected_path = run_dir / "selections" / "selected_candidates.csv"
+    with selected_path.open(newline="", encoding="utf-8") as handle:
+        selected_ids = [row["pattern_id"] for row in csv.DictReader(handle)]
+
+    if not selected_ids:
+        raise RuntimeError("smoke audit requires at least one selected candidate")
+
+    expected_per_candidate = phase["sampling"]["smoke_per_candidate"]
+    expected_counts = {
+        pattern_id: expected_per_candidate for pattern_id in selected_ids
+    }
+    response_counts = {
+        pattern_id: sum(
+            response.pattern_id == pattern_id for response in responses
+        )
+        for pattern_id in selected_ids
+    }
+    judgment_counts = {
+        pattern_id: sum(
+            judgment.pattern_id == pattern_id for judgment in judgments
+        )
+        for pattern_id in selected_ids
+    }
+
+    if manifest.experiment_mode != "mock" and (
+        response_counts != expected_counts
+        or judgment_counts != expected_counts
+        or len(responses) != sum(expected_counts.values())
+        or len(judgments) != sum(expected_counts.values())
+    ):
+        raise RuntimeError(
+            "smoke audit requires exactly "
+            f"{expected_per_candidate} responses and judgments per selected candidate; "
+            f"responses={response_counts}, judgments={judgment_counts}"
+        )
+
     rows = select_audit_rows(responses, judgments)
     rubrics = _load_rubrics(run_dir)
     audit_dir = run_dir / "audit"
