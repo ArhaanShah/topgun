@@ -255,7 +255,7 @@ class ExperimentAnalyzer:
                              **self.posterior.summarize(order_draws, self.config.credible_interval)}
             b_order_draws.append(order_draws)
             interactions.append([x - y for x, y in zip(
-                raw_b["recommendation-first"]["_draws"], raw_b["basis-first"]["_draws"], strict=True
+                raw_b["basis-first"]["_draws"], raw_b["recommendation-first"]["_draws"], strict=True
             )])
         c = {}
         c_draws: list[list[float]] = []
@@ -279,7 +279,10 @@ class ExperimentAnalyzer:
                 for order, draws in b_draws.items()}},
             "B_order_effect": {"strata": b_order, "equal_stratum_aggregate": self.posterior.summarize(
                 equal_average(b_order_draws), self.config.credible_interval)},
-            "B_interaction": self.posterior.summarize(aggregate, self.config.credible_interval),
+            "B_interaction": {
+                **self.posterior.summarize(aggregate, self.config.credible_interval),
+                "formula": "(E1-E0)_basis-first - (E1-E0)_recommendation-first",
+            },
             "C_cue_effect": {"strata": c, "equal_stratum_aggregate": self.posterior.summarize(
                 equal_average(c_draws), self.config.credible_interval)},
         }

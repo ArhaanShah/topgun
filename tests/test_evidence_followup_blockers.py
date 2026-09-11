@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
+import types
 
 import pytest
 
 from phase_a import evidence_followup as ef
+from phase_a.config import load_profile
 from phase_a.evidence_followup_analysis import AnalysisConfig, ExperimentAnalyzer
-from phase_a.inference import Completion
+from phase_a.inference import Completion, VLLMBackend
 
 
 class DistinctTokenizer:
@@ -51,6 +54,42 @@ class InterruptingBackend:
         if self.calls == self.fail_at:
             raise RuntimeError("simulated interruption")
         return [Completion(f"sample {seeds[0]}", "stop", len(prompts[0].split()), 2, [1, 2])]
+
+
+def test_vllm_stress_path_forces_length_and_ordinary_path_allows_eos(monkeypatch):
+    sampling_calls = []
+
+    class FakeSamplingParams:
+        def __init__(self, **kwargs):
+            sampling_calls.append(kwargs)
+            self.ignore_eos = kwargs.get("ignore_eos", False)
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate(self, prompts, sampling, use_tqdm):
+            count = 4096 if sampling.ignore_eos else 1
+            reason = "length" if sampling.ignore_eos else "stop"
+            candidate = types.SimpleNamespace(text="a", finish_reason=reason, token_ids=list(range(count)))
+            request = types.SimpleNamespace(outputs=[candidate], prompt_token_ids=[1, 2])
+            return [request]
+
+    fake = types.ModuleType("vllm")
+    fake.LLM = FakeLLM
+    fake.SamplingParams = FakeSamplingParams
+    monkeypatch.setitem(sys.modules, "vllm", fake)
+    backend = VLLMBackend(load_profile("qwen3_6_27b_awq_a100_followup"))
+
+    ordinary = backend.generate(["prompt"], [1], {"temperature": 0.7, "top_p": 0.9, "max_tokens": 4096})[0]
+    stress = backend.generate_technical_stress(["prompt"], [1])[0]
+
+    assert ordinary.finish_reason == "stop"
+    assert ordinary.completion_tokens == 1
+    assert stress.finish_reason == "length"
+    assert stress.completion_tokens == 4096
+    assert sampling_calls[0] == {"temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "seed": 1}
+    assert sampling_calls[1] == {"max_tokens": 4096, "min_tokens": 4096, "ignore_eos": True, "seed": 1}
 
 
 def test_production_uses_and_reverifies_real_tokenizer(monkeypatch, tmp_path):
@@ -115,7 +154,7 @@ def test_interrupted_followup_resume_never_overwrites_committed_records(tmp_path
     assert len({record["response_id"] for record in after.values()}) == 144
 
 
-def test_four_cell_interaction_negative_and_task_transfer_is_separate(tmp_path):
+def test_four_cell_interaction_positive_and_task_transfer_is_separate(tmp_path):
     responses, labels = [], []
     rid = 0
     for task in ("S", "D", "Z"):
@@ -151,7 +190,8 @@ def test_four_cell_interaction_negative_and_task_transfer_is_separate(tmp_path):
         writer.writerows(labels)
     analyzer = ExperimentAnalyzer(response_path, label_path, AnalysisConfig(posterior_draws=1000))
     effects = analyzer.analyze_experiment_effects("full")
-    assert effects["B_interaction"]["mean_difference"] < 0
+    assert effects["B_interaction"]["mean_difference"] > 0
+    assert effects["B_interaction"]["formula"] == "(E1-E0)_basis-first - (E1-E0)_recommendation-first"
     assert abs(effects["B_order_effect"]["strata"]["S0"]["mean_difference"]) < 0.2
     transfer = analyzer.analyze_task_transfer("full")
     assert set(transfer) == {"A", "B", "C"}

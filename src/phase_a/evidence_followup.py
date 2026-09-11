@@ -1000,27 +1000,50 @@ def run_experiment(
         atomic_write_json(session_path, session)
         # Production gets a normal canary and an isolated forced-length 4096-token stress canary.
         if not mock:
+            normal_parameters = {**manifest["sampling"], "max_tokens": 64}
+            longest_prompt = max(schedule, key=lambda row: row["prompt"]["rendered_token_count"])["prompt"]
+            stress_parameters = {
+                "max_tokens": 4096,
+                "min_tokens": 4096,
+                "ignore_eos": True,
+                "custom_stops": [],
+            }
+            if longest_prompt["rendered_token_count"] + stress_parameters["max_tokens"] > 8192:
+                raise RuntimeError("stress canary prompt and output exceed the 8192-token context limit")
             canaries = [
-                ("normal", "Reply with exactly: canary pass", {**manifest["sampling"], "max_tokens": 64}, False),
-                ("stress_4096", "Continue emitting the lowercase letter a separated by spaces until stopped.",
-                 {**manifest["sampling"], "max_tokens": 4096}, True),
+                ("normal", "Reply with exactly: canary pass", normal_parameters, False),
+                ("stress_4096", longest_prompt["rendered_prompt"], stress_parameters, True),
             ]
             for name, text, parameters, require_cap in canaries:
                 try:
-                    rendered = render_user_prompt(tokenizer, text, manifest["tokenizer_revision"])
-                    result = backend.generate(
-                        [rendered.rendered], [derive_experiment_seed(0, "canary", name)], parameters
-                    )
+                    stress_generator = getattr(backend, "generate_technical_stress", None)
+                    if require_cap and callable(stress_generator):
+                        rendered_text = text
+                        prompt_token_count = longest_prompt["rendered_token_count"]
+                        result = stress_generator(
+                            [text], [derive_experiment_seed(0, "canary", name)]
+                        )
+                    else:
+                        rendered = render_user_prompt(tokenizer, text, manifest["tokenizer_revision"])
+                        rendered_text = rendered.rendered
+                        prompt_token_count = rendered.rendered_token_count
+                        result = backend.generate(
+                            [rendered.rendered], [derive_experiment_seed(0, "canary", name)], parameters
+                        )
                     if len(result) != 1:
                         raise RuntimeError(f"{name} canary returned the wrong completion count")
-                    _validate_completion(result[0], rendered.rendered_token_count, parameters["max_tokens"])
+                    _validate_completion(result[0], prompt_token_count, parameters["max_tokens"])
                     if not result[0].text.strip() or "\ufffd" in result[0].text:
                         raise RuntimeError(f"{name} canary output is empty or malformed")
                     if require_cap and (result[0].completion_tokens != 4096 or result[0].finish_reason != "length"):
                         raise RuntimeError("4096-token stress canary did not exercise the full length cap")
                     atomic_write_json(run_dir / "manifests" / "canaries" / f"{session_id}_{name}.json", {
                         "status": "PASS", "session_id": session_id, "kind": name, "parameters": parameters,
-                        "completion_tokens": result[0].completion_tokens, "finish_reason": result[0].finish_reason,
+                        "prompt_token_count": prompt_token_count,
+                        "prompt": rendered_text,
+                        "completion_count": len(result),
+                        "completion_tokens": result[0].completion_tokens,
+                        "finish_reason": result[0].finish_reason,
                     })
                 except Exception as exc:
                     attempt = _save_attempt(run_dir, f"canary_{name}", exc)

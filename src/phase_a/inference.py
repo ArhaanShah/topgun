@@ -140,6 +140,29 @@ class VLLMBackend:
             )
         return results
 
+    def generate_technical_stress(self, prompts: list[str], seeds: list[int]) -> list[Completion]:
+        """Generate without EOS so the hardware stress canary must reach 4096 tokens."""
+        results: list[Completion] = []
+        for prompt, seed in zip(prompts, seeds, strict=True):
+            sampling = self._sampling_cls(
+                max_tokens=4096,
+                min_tokens=4096,
+                ignore_eos=True,
+                seed=seed,
+            )
+            request = self.engine.generate([prompt], sampling, use_tqdm=False)[0]
+            candidate = request.outputs[0]
+            results.append(
+                Completion(
+                    text=candidate.text,
+                    finish_reason=str(candidate.finish_reason) if candidate.finish_reason else None,
+                    prompt_tokens=len(request.prompt_token_ids),
+                    completion_tokens=len(candidate.token_ids),
+                    token_ids=list(candidate.token_ids),
+                )
+            )
+        return results
+
 
 def make_backend(profile: dict[str, Any], mock: bool = False) -> Backend:
     return MockBackend() if mock or profile.get("backend") == "mock" else VLLMBackend(profile)
