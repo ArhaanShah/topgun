@@ -56,7 +56,7 @@ All required components have been implemented, tested, and documented.
   - Response identity computation (deterministic hashing)
   - Hardware verification (AWQ integrity, context fitting)
   - Process locking (atomic state management)
-  - Prepare, run, status, export commands (partial implementation)
+  - Prepare, run, status, review export/import, analysis, archive verification, and verified lock recovery
   - Mock mode for testing
 - **Design Constants:**
   - 48 unique prompts (3 tasks × 2 wordings × 2×evidence/2×order/2×cue factor combinations)
@@ -73,7 +73,7 @@ All required components have been implemented, tested, and documented.
   - Window-specific labeling (384, 1024, full token views)
   - CPU-only (no GPU dependencies)
 - **Analysis Methods:**
-  - Independent posterior draws per cell
+  - Deterministic standard-library posterior draws per cell
   - Beta(0.5, 0.5) prior for primary inference
   - Beta(1, 1) prior for sensitivity analysis
   - Coefficient-aware contrast extrema

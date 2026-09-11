@@ -91,7 +91,7 @@ followup-prepare:
 	python -m phase_a.evidence_followup prepare $(FOLLOWUP_COMMON) $(FOLLOWUP_DOWNLOAD)
 
 followup-run:
-	python -m phase_a.evidence_followup run $(FOLLOWUP_COMMON)
+	python -m phase_a.evidence_followup run $(FOLLOWUP_COMMON) --resume
 
 followup-status:
 	python -m phase_a.evidence_followup status $(FOLLOWUP_COMMON)
@@ -115,6 +115,4 @@ followup-recover-lock:
 	python -m phase_a.evidence_followup recover-lock $(FOLLOWUP_COMMON)
 
 followup-mock-e2e:
-	python -m phase_a.evidence_followup prepare $(FOLLOWUP_COMMON) --mock
-	python -m phase_a.evidence_followup status $(FOLLOWUP_COMMON)
-
+	python -m phase_a.evidence_followup mock-e2e $(FOLLOWUP_COMMON)

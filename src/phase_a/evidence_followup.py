@@ -9,15 +9,14 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import html
 import json
 import os
 import platform
 import random
-import shutil
-import subprocess
-import sys
+import tarfile
+import tempfile
 import time
-import tomllib
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,7 +24,7 @@ from typing import Any
 
 from .artifacts import hash_small_files
 from .config import REPO_ROOT, artifact_path, load_profile, load_yaml
-from .environment import enable_offline_mode, environment_report, git_info, package_versions, path_is_writable
+from .environment import enable_offline_mode, git_info
 from .inference import Backend, Completion, make_backend, render_user_prompt
 from .storage import atomic_write_json, atomic_write_text, canonical_json, compute_checksum
 
@@ -38,6 +37,17 @@ LOCK_PATH = "manifests/writer.lock"
 # Experimental design constants
 TASK_IDS = ["S", "D", "Z"]
 EXPERIMENTS = {"A": "natural", "B": "imposed_organization", "C": "provenance_reminder"}
+TRUE_VALUES = {"1", "true", "yes", "y", "t"}
+FALSE_VALUES = {"0", "false", "no", "n", "f"}
+
+
+def _label_bool(value: Any) -> bool | None:
+    text = str(value).strip().lower()
+    if text in TRUE_VALUES:
+        return True
+    if text in FALSE_VALUES or text == "":
+        return False if text in FALSE_VALUES else None
+    raise ValueError(f"invalid Boolean label {value!r}")
 
 
 class SimpleTokenizer:
@@ -87,10 +97,20 @@ def derive_experiment_seed(master_seed: int, namespace: str, *parts: object) -> 
     return int.from_bytes(hashlib.sha256(payload.encode()).digest()[:8], "big") & 0x7FFFFFFF
 
 
-def response_identity(experiment_id: str, experiment: str, task: str, wording: int, 
-                      evidence: int, order: str | None, cue: str | None, replicate: int) -> str:
+def response_identity(
+    experiment_id: str,
+    experiment: str,
+    task: str,
+    wording: int,
+    evidence: int,
+    order: str | None,
+    cue: str | None,
+    replicate: int,
+) -> str:
     """Compute unique response identity."""
-    payload = f"{experiment_id}||{experiment}||{task}||{wording}||{evidence}||{order or 'none'}||{cue or 'none'}||{replicate}"
+    payload = (
+        f"{experiment_id}||{experiment}||{task}||{wording}||{evidence}||{order or 'none'}||{cue or 'none'}||{replicate}"
+    )
     return hashlib.sha256(payload.encode()).hexdigest()[:24]
 
 
@@ -99,7 +119,7 @@ def load_experiment_config() -> tuple[dict[str, Any], dict[str, Any], dict[str, 
     config = load_yaml(CONFIG_PATH)
     prompts = load_yaml(PROMPTS_PATH)
     profile = load_profile(PROFILE_NAME)
-    
+
     if config.get("profile") != PROFILE_NAME:
         raise ValueError(f"experiment profile must be {PROFILE_NAME}")
     if config.get("prediction_note", {}).get("frozen") is not True:
@@ -108,35 +128,42 @@ def load_experiment_config() -> tuple[dict[str, Any], dict[str, Any], dict[str, 
         raise ValueError("sampling settings differ from the frozen followup design")
     if profile.get("max_model_len") != 8192 or profile.get("generation_config") != "vllm":
         raise ValueError("A100 followup profile must use 8192 context and vLLM generation defaults")
-    
+
     # Validate design totals
     if config.get("design", {}).get("total_responses") != 144:
         raise ValueError("the frozen design must contain exactly 144 responses")
     if config.get("design", {}).get("total_unique_prompts") != 48:
         raise ValueError("the frozen design must contain exactly 48 unique prompts")
-    
+
     return config, prompts, profile
 
 
-def render_prompt(config: dict[str, Any], prompts: dict[str, Any], 
-                  experiment: str, task: str, wording: int, 
-                  evidence: int = 0, order: str | None = None, cue: str | None = None) -> str:
+def render_prompt(
+    config: dict[str, Any],
+    prompts: dict[str, Any],
+    experiment: str,
+    task: str,
+    wording: int,
+    evidence: int = 0,
+    order: str | None = None,
+    cue: str | None = None,
+) -> str:
     """Render a complete prompt from task template and factors."""
     separator = "\n\n"
-    
+
     # Start with base task
     task_key = f"tasks.{task}.wording_{wording}"
     base_text = prompts.get("tasks", {}).get(task, {}).get(f"wording_{wording}", "")
     if not base_text:
         raise ValueError(f"Task prompt not found: {task_key}")
-    
+
     parts = [base_text]
-    
+
     # Add evidence request
     parts.append(prompts.get("evidence_common", ""))
     if evidence == 1:
         parts.append(prompts.get("evidence_benchmark", ""))
-    
+
     # Add format instructions (Experiment B only)
     if experiment == "B":
         if order == "recommendation-first":
@@ -145,7 +172,7 @@ def render_prompt(config: dict[str, Any], prompts: dict[str, Any],
             parts.append(prompts.get("format_basis_first", ""))
         else:
             raise ValueError(f"Invalid order for experiment B: {order}")
-    
+
     # Add cue instructions (Experiment C only)
     if experiment == "C":
         if cue == "neutral":
@@ -154,7 +181,7 @@ def render_prompt(config: dict[str, Any], prompts: dict[str, Any],
             parts.append(prompts.get("cue_execution_unavailable", ""))
         else:
             raise ValueError(f"Invalid cue for experiment C: {cue}")
-    
+
     return separator.join(part.strip() for part in parts if part.strip())
 
 
@@ -163,58 +190,64 @@ def build_schedule(config: dict[str, Any], prompts: dict[str, Any]) -> list[dict
     schedule: list[dict[str, Any]] = []
     seeds: set[int] = set()
     ids: set[str] = set()
-    
+
     # Define all 48 unique prompt variants
     variants = []
-    
+
     # Experiment A: Natural answers (12 prompts)
     for task in TASK_IDS:
         for wording in [0, 1]:
             for evidence in [0, 1]:
-                variants.append({
-                    "experiment": "A",
-                    "task": task,
-                    "wording": wording,
-                    "evidence": evidence,
-                    "order": None,
-                    "cue": None,
-                })
-    
+                variants.append(
+                    {
+                        "experiment": "A",
+                        "task": task,
+                        "wording": wording,
+                        "evidence": evidence,
+                        "order": None,
+                        "cue": None,
+                    }
+                )
+
     # Experiment B: Imposed organization (24 prompts)
     for task in TASK_IDS:
         for wording in [0, 1]:
             for evidence in [0, 1]:
                 for order in ["recommendation-first", "basis-first"]:
-                    variants.append({
-                        "experiment": "B",
-                        "task": task,
-                        "wording": wording,
-                        "evidence": evidence,
-                        "order": order,
-                        "cue": None,
-                    })
-    
+                    variants.append(
+                        {
+                            "experiment": "B",
+                            "task": task,
+                            "wording": wording,
+                            "evidence": evidence,
+                            "order": order,
+                            "cue": None,
+                        }
+                    )
+
     # Experiment C: Provenance reminder (12 prompts)
     for task in TASK_IDS:
         for wording in [0, 1]:
             for cue in ["neutral", "execution-unavailable"]:
-                variants.append({
-                    "experiment": "C",
-                    "task": task,
-                    "wording": wording,
-                    "evidence": 1,  # C always has evidence=1
-                    "order": None,
-                    "cue": cue,
-                })
-    
+                variants.append(
+                    {
+                        "experiment": "C",
+                        "task": task,
+                        "wording": wording,
+                        "evidence": 1,  # C always has evidence=1
+                        "order": None,
+                        "cue": cue,
+                    }
+                )
+
     if len(variants) != 48:
         raise AssertionError(f"the frozen design must have 48 unique prompts, got {len(variants)}")
-    
+
     # Create 3 balanced rounds (144 responses total, 48 per round)
     for round_num in range(3):
         block = list(range(len(variants)))
         random.Random(derive_experiment_seed(config["master_seed"], "order", round_num)).shuffle(block)
-        
+
         for within_block, variant_idx in enumerate(block):
             variant = variants[variant_idx]
             factors = (
@@ -226,47 +259,55 @@ def build_schedule(config: dict[str, Any], prompts: dict[str, Any]) -> list[dict
                 variant.get("cue"),
                 round_num,
             )
-            
+
             seed = derive_experiment_seed(config["master_seed"], "sample", *factors)
             response_id = response_identity(config["experiment_id"], *factors)
-            
+
             if seed in seeds or response_id in ids:
                 raise AssertionError("response seeds and IDs must be unique")
             seeds.add(seed)
             ids.add(response_id)
-            
-            schedule.append({
-                "response_id": response_id,
-                "experiment": variant["experiment"],
-                "task": variant["task"],
-                "wording": variant["wording"],
-                "evidence": variant["evidence"],
-                "order": variant.get("order"),
-                "cue": variant.get("cue"),
-                "replicate": round_num,
-                "block": round_num,
-                "within_block": within_block,
-                "generation_order": len(schedule),
-                "seed": seed,
-                "raw_prompt": render_prompt(config, prompts, variant["experiment"], 
-                                           variant["task"], variant["wording"],
-                                           variant["evidence"], variant.get("order"), 
-                                           variant.get("cue")),
-            })
-    
+
+            schedule.append(
+                {
+                    "response_id": response_id,
+                    "experiment": variant["experiment"],
+                    "task": variant["task"],
+                    "wording": variant["wording"],
+                    "evidence": variant["evidence"],
+                    "order": variant.get("order"),
+                    "cue": variant.get("cue"),
+                    "replicate": round_num,
+                    "block": round_num,
+                    "within_block": within_block,
+                    "generation_order": len(schedule),
+                    "seed": seed,
+                    "raw_prompt": render_prompt(
+                        config,
+                        prompts,
+                        variant["experiment"],
+                        variant["task"],
+                        variant["wording"],
+                        variant["evidence"],
+                        variant.get("order"),
+                        variant.get("cue"),
+                    ),
+                }
+            )
+
     if len(schedule) != 144:
         raise AssertionError(f"the frozen schedule must contain exactly 144 responses, got {len(schedule)}")
-    
+
     # Verify each round contains all 48 variants
     for round_num in range(3):
         round_variants = [
-            (row["experiment"], row["task"], row["wording"], row["evidence"], 
-             row["order"], row["cue"])
-            for row in schedule if row["block"] == round_num
+            (row["experiment"], row["task"], row["wording"], row["evidence"], row["order"], row["cue"])
+            for row in schedule
+            if row["block"] == round_num
         ]
         if len(set(round_variants)) != 48:
             raise AssertionError(f"round {round_num} must cover all 48 variants")
-    
+
     return schedule
 
 
@@ -285,7 +326,7 @@ def _require_explicit_paths(
 
 class ProcessLock(AbstractContextManager["ProcessLock"]):
     """Nonblocking exclusive write lock for run directory."""
-    
+
     def __init__(self, run_dir: Path):
         self.path = run_dir / LOCK_PATH
         self.acquired = False
@@ -533,16 +574,36 @@ def prepare_experiment(
     """Prepare a run: validate configs, build schedule, verify artifacts, set up directories."""
     run_dir = runs_dir
     run_dir.mkdir(parents=True, exist_ok=True)
-    
+    with ProcessLock(run_dir):
+        return _prepare_experiment_locked(run_id, cache_dir, run_dir, download=download, mock=mock)
+
+
+def _prepare_experiment_locked(
+    run_id: str, cache_dir: Path, run_dir: Path, *, download: bool, mock: bool
+) -> dict[str, Any]:
+
     # Load and validate config
     config, prompts, profile = load_experiment_config()
-    
+
     # Build the frozen schedule
     schedule = build_schedule(config, prompts)
-    
+
     # Record basic metadata
-    git_commit, git_remote_url, git_dirty = git_info(REPO_ROOT)
-    
+    git = git_info(REPO_ROOT)
+    git_commit = git["commit_sha"]
+    git_remote_url = git["remote_url"]
+    git_dirty = bool(git["dirty"])
+    if git_dirty and not mock:
+        raise RuntimeError("production preparation requires a clean Git worktree")
+    existing = run_dir / "prepare_manifest.json"
+    if existing.exists():
+        previous = json.loads(existing.read_text(encoding="utf-8"))
+        if previous.get("schedule_hash") == _hash_value(schedule) and bool(previous.get("mock")) == mock:
+            return previous
+        if any(run_dir.glob("responses/*.json")):
+            raise RuntimeError("cannot change a prepared run after responses exist")
+        raise RuntimeError("existing prepared run is incompatible; choose a new run ID")
+
     metadata: dict[str, Any] = {
         "status": "PREPARED",
         "run_id": run_id,
@@ -552,28 +613,375 @@ def prepare_experiment(
         "schedule_size": len(schedule),
         "config_hashes": _snapshot_files(run_dir),
         "experiment_mode": "mock" if mock else "evidence-followup",
+        "mock": mock,
+        "profile": PROFILE_NAME,
+        "sampling": config["sampling"],
+        "schedule_hash": _hash_value(schedule),
     }
-    
+
     if not mock:
-        # Verify model artifacts
-        target_info = verify_target(cache_dir, profile, load_transformers=False)
         if download:
             try:
                 _download_target(cache_dir, profile)
-                target_info = verify_target(cache_dir, profile, load_transformers=False)
             except Exception as e:
                 metadata["download_error"] = str(e)
                 raise
+        # Download must precede verification on a fresh machine.
+        target_info = verify_target(cache_dir, profile, load_transformers=False)
         metadata["model_verification"] = target_info
-    
-    # Save schedule to run directory
+
+    # Save immutable schedule rows and the rendered prompt/token accounting.
     schedule_path = run_dir / "schedule.jsonl"
+    rendered_rows = []
+    tokenizer = SimpleTokenizer()
     for row in schedule:
         atomic_write_json(schedule_path.parent / f"schedule_{row['generation_order']:04d}.json", row)
-    
+        rendered = render_user_prompt(tokenizer, row["raw_prompt"], profile["tokenizer_revision"])
+        if rendered.rendered_token_count + config["sampling"]["max_tokens"] > profile["max_model_len"]:
+            raise RuntimeError(f"prompt {row['response_id']} does not fit the frozen context")
+        rendered_rows.append(
+            {
+                **row,
+                "prompt": {
+                    "rendered_prompt": rendered.rendered,
+                    "raw_token_count": rendered.raw_token_count,
+                    "rendered_token_count": rendered.rendered_token_count,
+                    "rendered_hash": rendered.rendered_hash,
+                    "tokenizer_hash": rendered.tokenizer_hash,
+                },
+            }
+        )
+    atomic_write_text(run_dir / "schedule.jsonl", "".join(canonical_json(row) + "\n" for row in rendered_rows))
+
     # Save manifest
     atomic_write_json(run_dir / "prepare_manifest.json", metadata)
     return metadata
+
+
+def _schedule(run_dir: Path) -> list[dict[str, Any]]:
+    path = run_dir / "schedule.jsonl"
+    if path.exists():
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [json.loads(path_.read_text(encoding="utf-8")) for path_ in sorted(run_dir.glob("schedule_*.json"))]
+
+
+def _records(run_dir: Path) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for path in sorted((run_dir / "responses").glob("*.json")):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        rid = record.get("response_id")
+        if (
+            not rid
+            or rid in result
+            or record.get("record_hash") != _hash_value({k: v for k, v in record.items() if k != "record_hash"})
+        ):
+            raise RuntimeError(f"invalid or duplicate response record: {path}")
+        result[rid] = record
+    return result
+
+
+def _mock_completion(row: dict[str, Any]) -> Completion:
+    count = 4096 if row["generation_order"] % 48 == 0 else (1100 if row["generation_order"] % 17 == 0 else 12)
+    text = " ".join(f"token{i}" for i in range(count))
+    return Completion(
+        text, "length" if count == 4096 else "stop", row["prompt"]["rendered_token_count"], count, list(range(count))
+    )
+
+
+def run_experiment(
+    run_dir: Path,
+    cache_dir: Path,
+    *,
+    resume: bool,
+    mock: bool = False,
+    backend: Backend | None = None,
+    tokenizer: Any | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    manifest_path = run_dir / "prepare_manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError("prepare must complete before run")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if bool(manifest.get("mock")) != mock:
+        raise RuntimeError("mock/production mode must match the prepared run")
+    schedule = _schedule(run_dir)
+    if len(schedule) != 144:
+        raise RuntimeError("frozen schedule is incomplete")
+    records = _records(run_dir)
+    if records and not resume:
+        raise RuntimeError("records already exist; pass --resume to continue")
+    pending = [row for row in schedule if row["response_id"] not in records][:limit]
+    if not pending:
+        return status_run(run_dir)
+    with ProcessLock(run_dir):
+        tokenizer = tokenizer or (SimpleTokenizer() if mock else _load_tokenizer(cache_dir, load_profile(PROFILE_NAME)))
+        if backend is None and not mock:
+            profile = load_profile(PROFILE_NAME)
+            runtime = dict(profile)
+            runtime["model"] = str(artifact_path(cache_dir, profile["model"], profile["revision"]))
+            runtime["tokenizer"] = str(artifact_path(cache_dir, profile["tokenizer"], profile["tokenizer_revision"]))
+            backend = make_backend(runtime)
+        for row in pending:
+            started = time.monotonic()
+            rendered = row.get("prompt", {}).get("rendered_prompt") or row["raw_prompt"]
+            completion = (
+                _mock_completion(row) if mock else backend.generate([rendered], [row["seed"]], manifest["sampling"])[0]
+            )  # type: ignore[union-attr]
+            payload = {
+                "response_id": row["response_id"],
+                "experiment": row["experiment"],
+                "task": row["task"],
+                "wording": row["wording"],
+                "evidence": row["evidence"],
+                "order": row["order"],
+                "cue": row["cue"],
+                "replicate": row["replicate"],
+                "seed": row["seed"],
+                "raw_prompt": row["raw_prompt"],
+                "rendered_prompt": rendered,
+                "prompt_token_count": completion.prompt_tokens,
+                "output_token_ids": list(completion.token_ids or []),
+                "response_text": completion.text,
+                "decoded_384": " ".join(completion.text.split()[:384]),
+                "decoded_1024": " ".join(completion.text.split()[:1024]),
+                "completion_token_count": completion.completion_tokens,
+                "finish_reason": completion.finish_reason,
+                "duration_seconds": time.monotonic() - started,
+                "generated_at": _utc_now(),
+                "immutable_content_hash": compute_checksum(completion.text),
+            }
+            atomic_write_json(
+                run_dir / "responses" / f"{row['response_id']}.json", {**payload, "record_hash": _hash_value(payload)}
+            )
+            records[row["response_id"]] = {**payload, "record_hash": _hash_value(payload)}
+            if len(records) % 48 == 0:
+                atomic_write_json(
+                    run_dir / "checkpoints" / f"checkpoint_{len(records):03d}.json",
+                    {"count": len(records), "response_ids": sorted(records), "created_at": _utc_now()},
+                )
+        atomic_write_text(
+            run_dir / "responses.jsonl",
+            "".join(
+                canonical_json(records[row["response_id"]]) + "\n" for row in schedule if row["response_id"] in records
+            ),
+        )
+    return status_run(run_dir)
+
+
+def status_run(run_dir: Path) -> dict[str, Any]:
+    schedule, records = _schedule(run_dir), _records(run_dir)
+    failed_ids = {path.stem for path in (run_dir / "errors").glob("*.json")} if (run_dir / "errors").exists() else set()
+    counts = {"planned": len(schedule), "successful": 0, "capped": 0, "missing": 0, "failed": 0, "pending": 0}
+    for row in schedule:
+        record = records.get(row["response_id"])
+        if not record and row["response_id"] in failed_ids:
+            counts["failed"] += 1
+        elif not record:
+            counts["pending"] += 1
+        elif record.get("finish_reason") == "length" or record.get("completion_token_count") >= 4096:
+            counts["capped"] += 1
+        else:
+            counts["successful"] += 1
+    return {"status": "COMPLETE" if counts["pending"] == 0 else "IN_PROGRESS", **counts}
+
+
+def export_run(run_dir: Path, output_dir: Path | None = None) -> Path:
+    """Create a portable checksum-protected archive without model or environment files."""
+    run_dir = Path(run_dir).resolve()
+    if not (run_dir / "prepare_manifest.json").exists():
+        raise RuntimeError("prepared run is required")
+    output_dir = Path(output_dir or run_dir.parent).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = output_dir / f"evidence_followup_{run_dir.name}.tar.gz"
+    allowed = {
+        "config_snapshot",
+        "manifests",
+        "responses",
+        "audit",
+        "reports",
+        "checkpoints",
+        "errors",
+        "schedule.jsonl",
+        "prepare_manifest.json",
+        "responses.jsonl",
+    }
+    with tarfile.open(archive_path, "w:gz") as archive:
+        for path in sorted(run_dir.rglob("*")):
+            if not path.is_file() or path.name in {"writer.lock"}:
+                continue
+            relative = path.relative_to(run_dir)
+            if relative.parts[0] not in allowed:
+                continue
+            archive.add(path, arcname=f"{run_dir.name}/{relative.as_posix()}", recursive=False)
+    digest = compute_checksum(archive_path.read_bytes())
+    atomic_write_text(archive_path.with_name(archive_path.name + ".sha256"), f"{digest}  {archive_path.name}\n")
+    return archive_path
+
+
+def verify_run(archive_path: Path, extracted_run: Path | None = None) -> dict[str, Any]:
+    """Verify checksum and extract into a caller-selected directory, then validate records."""
+    archive_path = Path(archive_path).resolve()
+    sidecar = archive_path.with_name(archive_path.name + ".sha256")
+    if not sidecar.exists() or sidecar.read_text(encoding="utf-8").split()[0] != compute_checksum(
+        archive_path.read_bytes()
+    ):
+        raise ValueError("archive SHA-256 mismatch or missing sidecar")
+    destination = Path(extracted_run).resolve() if extracted_run else Path(tempfile.mkdtemp(prefix="followup-verify-"))
+    destination.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for member in archive.getmembers():
+            pure = Path(member.name)
+            if pure.is_absolute() or ".." in pure.parts or member.issym() or member.islnk():
+                raise ValueError(f"unsafe archive member: {member.name}")
+        archive.extractall(destination)
+    roots = [path for path in destination.iterdir() if path.is_dir()]
+    if len(roots) != 1:
+        raise ValueError("archive must contain one run directory")
+    run = roots[0]
+    records = _records(run)
+    schedule = _schedule(run)
+    if any(rid not in {row["response_id"] for row in schedule} for rid in records):
+        raise ValueError("archive contains a response outside the frozen schedule")
+    return {
+        "status": "VERIFIED",
+        "run": str(run),
+        "planned": len(schedule),
+        "records": len(records),
+        "complete": len(records) == len(schedule),
+    }
+
+
+def analyze_run(run_dir: Path) -> dict[str, Any]:
+    from .evidence_followup_analysis import ExperimentAnalyzer
+
+    active = run_dir / "audit" / "active_labels.json"
+    if not active.exists():
+        raise RuntimeError("validated imported labels are required before analysis")
+    labels = run_dir / "audit" / json.loads(active.read_text(encoding="utf-8"))["path"]
+    responses = run_dir / "responses.jsonl"
+    return ExperimentAnalyzer(responses, labels).analyze(run_dir / "reports")
+
+
+def mock_e2e(run_id: str, cache_dir: Path, runs_dir: Path) -> dict[str, Any]:
+    run_dir = runs_dir / run_id
+    prepare_experiment(run_id, cache_dir, run_dir, mock=True)
+    run_experiment(run_dir, cache_dir, resume=True, mock=True)
+    review = export_audit(run_dir)
+    labels = run_dir / "audit" / "mock_labels.csv"
+    with review.open(newline="", encoding="utf-8") as source, labels.open("w", newline="", encoding="utf-8") as target:
+        rows = list(csv.DictReader(source))
+        fields = list(rows[0])
+        writer = csv.DictWriter(target, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            for field in fields:
+                if field.startswith(("execution_claim_", "unsupported_measurements_", "ambiguous_", "retracted_")):
+                    row[field] = "false"
+                elif field.startswith("evidence_quote_"):
+                    row[field] = ""
+            writer.writerow(row)
+    import_audit(run_dir, labels)
+    report = analyze_run(run_dir)
+    archive = export_run(run_dir, runs_dir)
+    verified = verify_run(archive, runs_dir / f"{run_id}_verified")
+    return {
+        "status": "COMPLETE_MOCK",
+        "run_dir": str(run_dir),
+        "analysis": report,
+        "archive": str(archive),
+        "verification": verified,
+    }
+
+
+def export_audit(run_dir: Path) -> Path:
+    records = _records(run_dir)
+    schedule = _schedule(run_dir)
+    target = run_dir / "audit" / "human_review.csv"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "response_id",
+        "immutable_content_hash",
+        "saved_1024",
+        "full_response",
+        *(
+            f"{field}_{window}"
+            for field in ("execution_claim", "unsupported_measurements", "ambiguous", "retracted", "evidence_quote")
+            for window in ("384", "1024", "full")
+        ),
+    ]
+    with target.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in schedule:
+            record = records.get(row["response_id"])
+            if not record:
+                continue
+            writer.writerow(
+                {
+                    "response_id": row["response_id"],
+                    "immutable_content_hash": record["immutable_content_hash"],
+                    "saved_1024": record["decoded_1024"],
+                    "full_response": record["response_text"],
+                }
+            )
+    html_path = target.with_suffix(".html")
+    html_path.write_text(
+        "<html><body><p>Condition metadata and automated labels are intentionally hidden; "
+        "responses may nevertheless reveal their condition.</p><table>"
+        + "".join(
+            "<tr><td>"
+            + html.escape(row["response_id"])
+            + "</td><td><pre>"
+            + html.escape(row["saved_1024"])
+            + "</pre></td></tr>"
+            for row in csv.DictReader(target.open(encoding="utf-8"))
+        )
+        + "</table></body></html>",
+        encoding="utf-8",
+    )
+    return target
+
+
+def import_audit(run_dir: Path, labels_path: Path) -> Path:
+    records = _records(run_dir)
+    expected = {row["response_id"] for row in _schedule(run_dir)}
+    with Path(labels_path).open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    ids = [row.get("response_id", "") for row in rows]
+    if set(ids) != expected or len(ids) != len(set(ids)):
+        raise ValueError("labels must contain every expected response ID exactly once")
+    allowed = TRUE_VALUES | FALSE_VALUES | {""}
+    for row in rows:
+        rid = row["response_id"]
+        if rid not in records:
+            raise ValueError(f"{rid}: response has not been collected")
+        if row.get("immutable_content_hash") != records[rid]["immutable_content_hash"]:
+            raise ValueError(f"{rid}: immutable content hash mismatch")
+        for key, value in row.items():
+            if (
+                key.startswith(("execution_claim_", "unsupported_measurements_", "ambiguous_", "retracted_"))
+                and value.lower() not in allowed
+            ):
+                raise ValueError(f"{rid}: invalid label {key}")
+            if (
+                key.startswith("evidence_quote_")
+                and _label_bool(row.get(f"execution_claim_{key.rsplit('_', 1)[-1]}")) is True
+            ):
+                if not value.strip() or value not in records[rid]["response_text"]:
+                    raise ValueError(f"{rid}: positive labels require an exact evidence quote")
+    audit = run_dir / "audit"
+    audit.mkdir(exist_ok=True)
+    version = len(list(audit.glob("imported_labels_v*.csv"))) + 1
+    target = audit / f"imported_labels_v{version}.csv"
+    with target.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    atomic_write_json(
+        audit / "active_labels.json",
+        {"path": target.name, "version": version, "sha256": compute_checksum(target.read_bytes())},
+    )
+    return target
 
 
 # CLI commands follow the understand_2x2 pattern
@@ -581,7 +989,7 @@ def main() -> None:
     """Main CLI entry point for evidence followup experiment."""
     parser = argparse.ArgumentParser(description="Evidence followup experiment: 144-response design")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    
+
     # Prepare
     prep = subparsers.add_parser("prepare", help="Prepare experiment: validate configs and build schedule")
     prep.add_argument("--run-id", required=True, help="Unique run identifier")
@@ -589,22 +997,40 @@ def main() -> None:
     prep.add_argument("--runs-dir", required=True, help="Runs base directory")
     prep.add_argument("--download", action="store_true", help="Download model if missing")
     prep.add_argument("--mock", action="store_true", help="Mock mode for testing")
-    
+
     # Status
     status_cmd = subparsers.add_parser("status", help="Show run status")
     status_cmd.add_argument("--run-id", required=True, help="Run identifier")
     status_cmd.add_argument("--cache-dir", required=True, help="Cache directory")
     status_cmd.add_argument("--runs-dir", required=True, help="Runs directory")
-    
+
     # Run
     run_cmd = subparsers.add_parser("run", help="Execute generation")
     run_cmd.add_argument("--run-id", required=True, help="Run identifier")
     run_cmd.add_argument("--cache-dir", required=True, help="Cache directory")
     run_cmd.add_argument("--runs-dir", required=True, help="Runs directory")
     run_cmd.add_argument("--mock", action="store_true", help="Mock mode")
-    
+    run_cmd.add_argument("--limit", type=int)
+    run_cmd.add_argument("--resume", action="store_true")
+    for name in ("export-audit", "analyze", "export-run", "verify-run", "recover-lock", "mock-e2e"):
+        item = subparsers.add_parser(name)
+        item.add_argument("--run-id", required=False)
+        item.add_argument("--cache-dir", required=False)
+        item.add_argument("--runs-dir", required=False)
+        item.add_argument("--run", type=Path)
+        if name == "export-run":
+            item.add_argument("--output-dir", type=Path)
+        if name == "verify-run":
+            item.add_argument("--archive", type=Path)
+            item.add_argument("--extract-to", type=Path)
+    imp = subparsers.add_parser("import-audit")
+    imp.add_argument("--run-id", required=True)
+    imp.add_argument("--cache-dir", required=True)
+    imp.add_argument("--runs-dir", required=True)
+    imp.add_argument("--labels", type=Path, required=True)
+
     args = parser.parse_args()
-    
+
     if args.command == "prepare":
         cache_dir, runs_dir = _require_explicit_paths(args.run_id, args.cache_dir, args.runs_dir)
         result = prepare_experiment(
@@ -617,14 +1043,40 @@ def main() -> None:
         print(json.dumps(result, indent=2, default=str))
     elif args.command == "status":
         cache_dir, runs_dir = _require_explicit_paths(args.run_id, args.cache_dir, args.runs_dir)
-        manifest_path = runs_dir / "prepare_manifest.json"
-        if manifest_path.exists():
-            data = json.loads(manifest_path.read_text(encoding="utf-8"))
-            print(json.dumps(data, indent=2, default=str))
-        else:
-            print("No manifest found")
+        print(json.dumps(status_run(runs_dir), indent=2))
     elif args.command == "run":
-        print("Run command not yet implemented")
+        _, runs_dir = _require_explicit_paths(args.run_id, args.cache_dir, args.runs_dir)
+        print(
+            json.dumps(
+                run_experiment(
+                    runs_dir,
+                    Path(args.cache_dir).resolve(),
+                    resume=args.resume if hasattr(args, "resume") else True,
+                    mock=args.mock,
+                    limit=args.limit,
+                ),
+                indent=2,
+            )
+        )
+    elif args.command == "mock-e2e":
+        _, runs_dir = _require_explicit_paths(args.run_id, args.cache_dir, args.runs_dir)
+        print(json.dumps(mock_e2e(args.run_id, Path(args.cache_dir).resolve(), runs_dir.parent), indent=2))
+    elif args.command in {"export-audit", "analyze", "export-run", "recover-lock", "import-audit"}:
+        _, run_dir = _require_explicit_paths(args.run_id, args.cache_dir, args.runs_dir)
+        if args.command == "export-audit":
+            print(export_audit(run_dir))
+        elif args.command == "import-audit":
+            print(import_audit(run_dir, args.labels))
+        elif args.command == "analyze":
+            print(json.dumps(analyze_run(run_dir), indent=2))
+        elif args.command == "recover-lock":
+            print(json.dumps(recover_stale_lock(run_dir), indent=2))
+        else:
+            print(export_run(run_dir, args.output_dir))
+    elif args.command == "verify-run":
+        if not args.archive:
+            raise ValueError("--archive is required")
+        print(json.dumps(verify_run(args.archive, args.extract_to), indent=2))
 
 
 if __name__ == "__main__":

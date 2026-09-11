@@ -1,44 +1,56 @@
-"""Analysis pipeline for evidence followup experiment.
+"""CPU-only analysis for the frozen evidence follow-up experiment.
 
-Handles factor-aware contrasts, window-specific labels, and Bayesian inference.
-CPU-only: no GPU dependencies or model imports required.
+The analysis deliberately joins factors from the trusted schedule to labels by
+immutable response ID.  Reviewer supplied factors are never used for contrasts.
 """
 
 from __future__ import annotations
 
 import csv
 import json
-from collections import defaultdict
-from dataclasses import dataclass, asdict
+import random
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-from scipy import stats
+TRUE_VALUES = {"1", "true", "yes", "y", "t"}
+FALSE_VALUES = {"0", "false", "no", "n", "f"}
+WINDOWS = ("384", "1024", "full")
 
 
 @dataclass
 class AnalysisConfig:
-    """Analysis settings from frozen design."""
     posterior_prior_alpha: float = 0.5
     posterior_prior_beta: float = 0.5
-    posterior_draws: int = 20000
+    posterior_draws: int = 20_000
     sensitivity_prior_alpha: float = 1.0
     sensitivity_prior_beta: float = 1.0
     credible_interval: float = 0.95
+    seed: int = 20260914
+
+
+def _bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in TRUE_VALUES:
+        return True
+    if text in FALSE_VALUES:
+        return False
+    if text == "":
+        return None
+    raise ValueError(f"invalid Boolean label {value!r}")
 
 
 class BayesianPosterior:
-    """Compute Bayesian posteriors for binary labels with Beta prior."""
-    
-    def __init__(self, alpha: float = 0.5, beta: float = 0.5, draws: int = 20000):
-        self.alpha = alpha
-        self.beta = beta
-        self.draws = draws
-        self.rng = np.random.RandomState(20260914)  # Analysis seed
-    
-    def posterior_interval(self, positives: int, total: int, credible: float = 0.95) -> dict[str, float]:
-        """Compute credible interval for posterior probability."""
+    """Small standard-library Beta posterior sampler."""
+
+    def __init__(self, alpha: float = 0.5, beta: float = 0.5, draws: int = 20_000, seed: int = 20260914):
+        self.alpha, self.beta, self.draws, self.seed = alpha, beta, draws, seed
+
+    def posterior_interval(self, positives: int, total: int, credible: float = 0.95) -> dict[str, float | int | None]:
+        if total < 0 or positives < 0 or positives > total:
+            raise ValueError("invalid posterior counts")
         if total == 0:
             return {
                 "rate": None,
@@ -47,183 +59,223 @@ class BayesianPosterior:
                 "lower": None,
                 "upper": None,
                 "credible_level": credible,
+                "n": 0,
+                "positives": 0,
             }
-        
-        # Posterior is Beta(alpha + positives, beta + negatives)
-        alpha_post = self.alpha + positives
-        beta_post = self.beta + (total - positives)
-        
-        # Draw samples
-        samples = self.rng.beta(alpha_post, beta_post, self.draws)
-        
-        # Compute statistics
-        mean = np.mean(samples)
-        median = np.median(samples)
-        lower, upper = np.percentile(samples, [(1 - credible) / 2 * 100, (1 + credible) / 2 * 100])
-        
+        a, b = self.alpha + positives, self.beta + total - positives
+        rng = random.Random(self.seed + positives * 1_000_003 + total)
+        draws = sorted(rng.betavariate(a, b) for _ in range(self.draws))
+        lo = draws[int((1 - credible) / 2 * (len(draws) - 1))]
+        hi = draws[int((1 + credible) / 2 * (len(draws) - 1))]
         return {
             "rate": positives / total,
-            "mean": float(mean),
-            "median": float(median),
-            "lower": float(lower),
-            "upper": float(upper),
+            "mean": a / (a + b),
+            "median": draws[len(draws) // 2],
+            "lower": lo,
+            "upper": hi,
             "credible_level": credible,
             "n": total,
+            "positives": positives,
         }
-    
-    def contrast_posterior(self, pos_a: int, total_a: int, pos_b: int, 
-                          total_b: int, credible: float = 0.95) -> dict[str, float]:
-        """Compute credible interval for difference in rates (B - A)."""
-        if total_a == 0 or total_b == 0:
-            return {
-                "difference": None,
-                "mean_difference": None,
-                "lower": None,
-                "upper": None,
-            }
-        
-        alpha_a = self.alpha + pos_a
-        beta_a = self.beta + (total_a - pos_a)
-        alpha_b = self.alpha + pos_b
-        beta_b = self.beta + (total_b - pos_b)
-        
-        # Draw samples and compute difference
-        samples_a = self.rng.beta(alpha_a, beta_a, self.draws)
-        samples_b = self.rng.beta(alpha_b, beta_b, self.draws)
-        diff_samples = samples_b - samples_a
-        
-        mean_diff = np.mean(diff_samples)
-        lower, upper = np.percentile(diff_samples, [(1 - credible) / 2 * 100, (1 + credible) / 2 * 100])
-        
+
+    def contrast_posterior(
+        self, pos_a: int, total_a: int, pos_b: int, total_b: int, credible: float = 0.95
+    ) -> dict[str, float | None]:
+        if not total_a or not total_b:
+            return {"difference": None, "mean_difference": None, "lower": None, "upper": None}
+        a1, b1 = self.alpha + pos_a, self.beta + total_a - pos_a
+        a2, b2 = self.alpha + pos_b, self.beta + total_b - pos_b
+        rng = random.Random(self.seed + pos_a * 97 + pos_b * 193 + total_a * 389 + total_b * 769)
+        values = sorted(rng.betavariate(a2, b2) - rng.betavariate(a1, b1) for _ in range(self.draws))
+        lo = values[int((1 - credible) / 2 * (len(values) - 1))]
+        hi = values[int((1 + credible) / 2 * (len(values) - 1))]
         return {
-            "difference": (pos_b / total_b) - (pos_a / total_a) if total_a and total_b else None,
-            "mean_difference": float(mean_diff),
-            "lower": float(lower),
-            "upper": float(upper),
-            "credible_level": credible,
+            "difference": pos_b / total_b - pos_a / total_a,
+            "mean_difference": a2 / (a2 + b2) - a1 / (a1 + b1),
+            "lower": lo,
+            "upper": hi,
         }
 
 
 class ExperimentAnalyzer:
-    """Analyze evidence followup results across experiments and factors."""
-    
     def __init__(self, responses_path: Path, labels_path: Path, config: AnalysisConfig | None = None):
-        self.responses_path = responses_path
-        self.labels_path = labels_path
+        self.responses_path, self.labels_path = Path(responses_path), Path(labels_path)
         self.config = config or AnalysisConfig()
         self.posterior = BayesianPosterior(
-            alpha=self.config.posterior_prior_alpha,
-            beta=self.config.posterior_prior_beta,
-            draws=self.config.posterior_draws,
+            self.config.posterior_prior_alpha,
+            self.config.posterior_prior_beta,
+            self.config.posterior_draws,
+            self.config.seed,
         )
         self.responses: dict[str, dict[str, Any]] = {}
         self.labels: dict[str, dict[str, Any]] = {}
-    
+        self.rows: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _read(path: Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+        if path.suffix == ".jsonl":
+            return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        with path.open(newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+
     def load_responses(self) -> None:
-        """Load all response records."""
-        if not self.responses_path.exists():
-            return
-        with open(self.responses_path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                response_id = row.get("response_id")
-                if response_id:
-                    self.responses[response_id] = row
-    
+        rows = self._read(self.responses_path)
+        for row in rows:
+            rid = row.get("response_id")
+            if rid:
+                if rid in self.responses:
+                    raise ValueError(f"duplicate response ID {rid}")
+                self.responses[rid] = row
+
     def load_labels(self) -> None:
-        """Load human-labeled responses."""
-        if not self.labels_path.exists():
-            return
-        with open(self.labels_path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                response_id = row.get("response_id")
-                if response_id:
-                    self.labels[response_id] = row
-    
-    def get_labeled_subset(self, experiment: str | None = None, 
-                          window: str = "full") -> dict[str, int]:
-        """Get positive/total counts for a subset of responses."""
-        positives = 0
-        total = 0
-        
-        for response_id, label_row in self.labels.items():
-            if experiment and label_row.get("experiment") != experiment:
-                continue
-            
-            # Get label for this window
-            label_key = f"label_{window}"
-            if label_key not in label_row:
-                continue
-            
-            label_val = label_row[label_key]
-            if label_val == "":
-                continue
-            
-            total += 1
-            if label_val in {"true", "True", "1"}:
-                positives += 1
-        
-        return {"positives": positives, "total": total}
-    
+        rows = self._read(self.labels_path)
+        for row in rows:
+            rid = row.get("response_id")
+            if rid:
+                if rid in self.labels:
+                    raise ValueError(f"duplicate label ID {rid}")
+                self.labels[rid] = row
+
+    def _joined(self) -> list[dict[str, Any]]:
+        if not self.responses:
+            self.load_responses()
+        if not self.labels:
+            self.load_labels()
+        joined = []
+        for rid, response in self.responses.items():
+            if rid in self.labels:
+                joined.append({**response, **self.labels[rid], "response_id": rid})
+        self.rows = joined
+        return joined
+
+    def _cell(self, rows: list[dict[str, Any]], predicate, window: str) -> dict[str, Any]:
+        values = [
+            _bool(row.get(f"execution_claim_{window}", row.get(f"label_{window}"))) for row in rows if predicate(row)
+        ]
+        values = [value for value in values if value is not None]
+        positive = sum(values)
+        return {
+            "positives": positive,
+            "total": len(values),
+            "missing": len(rows) - len(values),
+            "posterior": self.posterior.posterior_interval(positive, len(values)),
+        }
+
+    def _contrast(self, rows: list[dict[str, Any]], left, right, window: str) -> dict[str, Any]:
+        a, b = self._cell(rows, left, window), self._cell(rows, right, window)
+        result = self.posterior.contrast_posterior(a["positives"], a["total"], b["positives"], b["total"])
+        return {"left": a, "right": b, **result}
+
+    def get_labeled_subset(self, experiment: str | None = None, window: str = "full") -> dict[str, int]:
+        rows = self._joined()
+        cell = self._cell(rows, (lambda r: not experiment or r.get("experiment") == experiment), window)
+        return {"positives": cell["positives"], "total": cell["total"]}
+
     def analyze_experiment_effects(self, window: str = "full") -> dict[str, Any]:
-        """Analyze primary effects within each experiment."""
-        results = {}
-        
-        # Experiment A: Evidence effect (within natural answers)
-        a_e0 = self.get_labeled_subset(experiment="A")  # A already filtered by labels
-        # TODO: need to refilter by evidence level in labels
-        results["A_evidence_effect"] = {"status": "needs_implementation"}
-        
-        # Experiment B: Order effect and evidence interaction
-        results["B_order_effect"] = {"status": "needs_implementation"}
-        results["B_evidence_effect"] = {"status": "needs_implementation"}
-        
-        # Experiment C: Cue effect
-        results["C_cue_effect"] = {"status": "needs_implementation"}
-        
-        return results
-    
+        rows = self._joined()
+        strata = [(task, wording) for task in ("S", "D", "Z") for wording in (0, 1)]
+        a_cells = {
+            f"{task}{wording}": self._contrast(
+                rows,
+                lambda r, t=task, w=wording: (
+                    r.get("experiment") == "A"
+                    and r.get("task") == t
+                    and str(r.get("wording")) == str(w)
+                    and str(r.get("evidence")) == "0"
+                ),
+                lambda r, t=task, w=wording: (
+                    r.get("experiment") == "A"
+                    and r.get("task") == t
+                    and str(r.get("wording")) == str(w)
+                    and str(r.get("evidence")) == "1"
+                ),
+                window,
+            )
+            for task, wording in strata
+        }
+        b_by_order = {}
+        for order in ("basis-first", "recommendation-first"):
+            b_by_order[order] = self._contrast(
+                rows,
+                lambda r, o=order: r.get("experiment") == "B" and r.get("order") == o and str(r.get("evidence")) == "0",
+                lambda r, o=order: r.get("experiment") == "B" and r.get("order") == o and str(r.get("evidence")) == "1",
+                window,
+            )
+        c = self._contrast(
+            rows,
+            lambda r: r.get("experiment") == "C" and r.get("cue") == "neutral",
+            lambda r: r.get("experiment") == "C" and r.get("cue") == "execution-unavailable",
+            window,
+        )
+        return {
+            "window": window,
+            "A_evidence_effect": {"strata": a_cells},
+            "B_evidence_effect": {"by_order": b_by_order},
+            "B_order_effect": b_by_order["basis-first"],
+            "B_interaction": self.posterior.contrast_posterior(
+                b_by_order["recommendation-first"]["right"]["positives"]
+                - b_by_order["recommendation-first"]["left"]["positives"],
+                max(
+                    b_by_order["recommendation-first"]["right"]["total"],
+                    b_by_order["recommendation-first"]["left"]["total"],
+                    1,
+                ),
+                b_by_order["basis-first"]["right"]["positives"] - b_by_order["basis-first"]["left"]["positives"],
+                max(b_by_order["basis-first"]["right"]["total"], b_by_order["basis-first"]["left"]["total"], 1),
+            ),
+            "C_cue_effect": c,
+        }
+
     def analyze_task_transfer(self, window: str = "full") -> dict[str, Any]:
-        """Analyze whether effects replicate across tasks."""
-        results = {}
-        
-        for task in ["S", "D", "Z"]:
-            # Compute contrasts within each task
-            results[f"task_{task}"] = {"status": "needs_implementation"}
-        
-        return results
-    
-    def generate_report(self, output_path: Path) -> None:
-        """Generate analysis report."""
-        self.load_responses()
-        self.load_labels()
-        
+        rows = self._joined()
+        return {
+            f"task_{task}": self._contrast(
+                rows,
+                lambda r, t=task: r.get("task") == t and str(r.get("evidence")) == "0",
+                lambda r, t=task: r.get("task") == t and str(r.get("evidence")) == "1",
+                window,
+            )
+            for task in ("S", "D", "Z")
+        }
+
+    def analyze(self, output_dir: Path) -> dict[str, Any]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._joined()
         report = {
-            "timestamp": str(Path.cwd()),
+            "config": asdict(self.config),
             "responses_loaded": len(self.responses),
             "labels_loaded": len(self.labels),
-            "experiment_effects": self.analyze_experiment_effects(),
-            "task_transfer": self.analyze_task_transfer(),
+            "experiment_effects": {},
+            "task_transfer": {},
+            "transitions": {},
         }
-        
-        with open(output_path, "w") as f:
-            json.dump(report, f, indent=2, default=str)
+        for window in WINDOWS:
+            report["experiment_effects"][window] = self.analyze_experiment_effects(window)
+            report["task_transfer"][window] = self.analyze_task_transfer(window)
+        for row in self.rows:
+            old = _bool(row.get("execution_claim_1024", row.get("label_1024")))
+            new = _bool(row.get("execution_claim_full", row.get("label_full")))
+            key = f"{old}->{new}"
+            report["transitions"][key] = report["transitions"].get(key, 0) + 1
+        (output_dir / "analysis_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return report
+
+    def generate_report(self, output_path: Path) -> None:
+        report = self.analyze(output_path.parent)
+        output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
 
 def main() -> None:
-    """CLI for analysis."""
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Analyze evidence followup responses")
-    parser.add_argument("--responses", type=Path, required=True, help="Responses CSV")
-    parser.add_argument("--labels", type=Path, required=True, help="Labels CSV")
-    parser.add_argument("--output", type=Path, required=True, help="Output report JSON")
-    
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--responses", type=Path, required=True)
+    parser.add_argument("--labels", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    
-    analyzer = ExperimentAnalyzer(args.responses, args.labels)
-    analyzer.generate_report(args.output)
+    ExperimentAnalyzer(args.responses, args.labels).analyze(args.output)
 
 
 if __name__ == "__main__":
