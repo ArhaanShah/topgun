@@ -1,13 +1,11 @@
 """Acceptance tests for evidence followup experiment implementation."""
 
 import json
-import tempfile
+import sys
 from pathlib import Path
 
 import pytest
 
-# Import the evidence_followup module
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from phase_a import evidence_followup as ef
@@ -150,7 +148,7 @@ class TestScheduleProperties:
         schedule2 = ef.build_schedule(config, prompts)
         
         assert len(schedule1) == len(schedule2)
-        for r1, r2 in zip(schedule1, schedule2):
+        for r1, r2 in zip(schedule1, schedule2, strict=True):
             assert r1["response_id"] == r2["response_id"]
             assert r1["seed"] == r2["seed"]
     
@@ -187,8 +185,6 @@ class TestPromptContextFitting:
         
         # Find longest prompt
         max_prompt_tokens = 0
-        longest_prompt = ""
-        
         for task in ef.TASK_IDS:
             for wording in [0, 1]:
                 for evidence in [0, 1]:
@@ -197,7 +193,6 @@ class TestPromptContextFitting:
                         tokens = len(tokenizer.encode(prompt))
                         if tokens > max_prompt_tokens:
                             max_prompt_tokens = tokens
-                            longest_prompt = prompt
         
         # Check fit
         max_tokens = profile["max_model_len"]
