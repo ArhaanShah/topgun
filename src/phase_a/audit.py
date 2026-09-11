@@ -91,20 +91,12 @@ def create_audit_package(run_dir: str | Path) -> Path:
         raise RuntimeError("smoke audit requires at least one selected candidate")
 
     expected_per_candidate = phase["sampling"]["smoke_per_candidate"]
-    expected_counts = {
-        pattern_id: expected_per_candidate for pattern_id in selected_ids
-    }
+    expected_counts = {pattern_id: expected_per_candidate for pattern_id in selected_ids}
     response_counts = {
-        pattern_id: sum(
-            response.pattern_id == pattern_id for response in responses
-        )
-        for pattern_id in selected_ids
+        pattern_id: sum(response.pattern_id == pattern_id for response in responses) for pattern_id in selected_ids
     }
     judgment_counts = {
-        pattern_id: sum(
-            judgment.pattern_id == pattern_id for judgment in judgments
-        )
-        for pattern_id in selected_ids
+        pattern_id: sum(judgment.pattern_id == pattern_id for judgment in judgments) for pattern_id in selected_ids
     }
 
     if manifest.experiment_mode != "mock" and (

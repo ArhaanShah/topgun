@@ -63,6 +63,7 @@ class Completion:
     finish_reason: str | None
     prompt_tokens: int
     completion_tokens: int
+    token_ids: list[int] | None = None
 
 
 class Backend(Protocol):
@@ -77,7 +78,8 @@ class MockBackend:
         for prompt, seed in zip(prompts, seeds, strict=True):
             token = random.Random(seed).choice(("alpha", "bravo", "charlie", "delta"))
             text = f"Mock local response {token} ({sha256_text(prompt)[:8]}; seed={seed})."
-            output.append(Completion(text, "stop", len(prompt.split()), len(text.split())))
+            token_ids = [int.from_bytes(hashlib.sha256(word.encode()).digest()[:4], "big") for word in text.split()]
+            output.append(Completion(text, "stop", len(prompt.split()), len(token_ids), token_ids))
         return output
 
 
@@ -100,6 +102,10 @@ class VLLMBackend:
             "max_num_seqs": profile.get("max_num_seqs", 1),
             "language_model_only": profile.get("language_model_only", True),
         }
+        if "generation_config" in profile:
+            kwargs["generation_config"] = profile["generation_config"]
+        if "seed" in profile:
+            kwargs["seed"] = profile["seed"]
         from pathlib import Path
 
         if not Path(profile["model"]).exists():
@@ -129,6 +135,7 @@ class VLLMBackend:
                     finish_reason=str(candidate.finish_reason) if candidate.finish_reason else None,
                     prompt_tokens=len(request.prompt_token_ids),
                     completion_tokens=len(candidate.token_ids),
+                    token_ids=list(candidate.token_ids),
                 )
             )
         return results

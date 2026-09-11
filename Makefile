@@ -4,7 +4,7 @@ RUNS_DIR ?= $(if $(PHASE_A_RUNS_DIR),$(PHASE_A_RUNS_DIR),.phase_a_runs)
 CACHE_DIR ?= $(if $(PHASE_A_CACHE_DIR),$(PHASE_A_CACHE_DIR),.phase_a_cache)
 COMMON = --profile $(PROFILE) --runs-dir $(RUNS_DIR) --cache-dir $(CACHE_DIR) --run-id $(RUN_ID)
 
-.PHONY: test check format preflight download verify-offline prepare health-check canary smoke judge-smoke reproduce judge-reproduction export-audit finalize export-run mock-e2e
+.PHONY: test check format preflight download verify-offline prepare health-check canary smoke judge-smoke reproduce judge-reproduction export-audit finalize export-run mock-e2e 2x2-prepare 2x2-run 2x2-export-audit 2x2-import-audit 2x2-analyze
 
 test:
 	python -m pytest -q
@@ -61,3 +61,21 @@ mock-e2e:
 	python -m phase_a.cli --command health-check $(COMMON) --mock
 	python -m phase_a.cli --command smoke $(COMMON) --mock
 	python -m phase_a.cli --command judge $(COMMON) --split smoke --mock
+
+2X2_COMMON = $(if $(strip $(RUN_ID)),,$(error RUN_ID is required))$(if $(filter command line environment,$(origin CACHE_DIR)),,$(error CACHE_DIR must be supplied explicitly))$(if $(filter command line environment,$(origin RUNS_DIR)),,$(error RUNS_DIR must be supplied explicitly))--run-id "$(RUN_ID)" --cache-dir "$(CACHE_DIR)" --runs-dir "$(RUNS_DIR)"
+2X2_DOWNLOAD = $(if $(filter 1,$(DOWNLOAD)),--download,)
+
+2x2-prepare:
+	python -m phase_a.understand_2x2 prepare $(2X2_COMMON) $(2X2_DOWNLOAD)
+
+2x2-run:
+	python -m phase_a.understand_2x2 run $(2X2_COMMON) --resume
+
+2x2-export-audit:
+	python -m phase_a.understand_2x2 export-audit $(2X2_COMMON)
+
+2x2-import-audit:
+	python -m phase_a.understand_2x2 import-audit $(2X2_COMMON) --labels "$(if $(strip $(LABELS)),$(LABELS),$(error LABELS is required))"
+
+2x2-analyze:
+	python -m phase_a.understand_2x2 analyze $(2X2_COMMON)

@@ -26,6 +26,8 @@ uv run ruff format --check src tests scripts
 
 The CPU suite uses tiny fixtures and mock inference. It does not download models or require a GPU.
 
+CPU setup can also be performed directly with `uv sync --frozen --python 3.11 --group dev`; omit the GPU extra on machines without CUDA.
+
 Before a production run, commit and push reviewed code, record `git rev-parse HEAD`, clone that exact commit on the L4, and confirm `git status --short` is empty. The run refuses a dirty tree; `--allow-dirty` is for development only and must not be used for production.
 
 ## L4 setup and artifact lock
@@ -93,3 +95,80 @@ Also note:
 ## Runtime layout
 
 Caches default to `.phase_a_cache/`; run state defaults to `.phase_a_runs/<run_id>/`. A run contains configuration and environment manifests, selections, rendered prompts, responses, judgments, a blinded audit package, reports, and crash-recovery checkpoints. Export is allowlisted and excludes model weights, datasets, caches, credentials, and logs.
+
+## A100 2x2 understanding experiment
+
+The separate `phase_a.understand_2x2` command implements the frozen 80-completion
+experiment in `2x2_implementation_plan.md`. It uses only the pinned AWQ target—no
+judge or WeirdChat download—and writes atomic source records outside the checkout.
+CPU checks establish pipeline readiness only; the A100 preflight, engine load, and
+1,024-token technical canary remain required hardware validation.
+
+Select an A100 40 GB Lightning Studio first. On a new instance clone the repository;
+in an existing Studio retain its checkout and model cache. Use a reviewed detached
+commit and do not pull while a run is active:
+
+```bash
+cd ~/topgun
+git fetch origin
+git switch --detach origin/main
+git rev-parse HEAD
+
+export PHASE_A_ROOT="$HOME/phase-a"
+export PHASE_A_CACHE_DIR="$PHASE_A_ROOT/cache"
+export HF_HOME="$PHASE_A_CACHE_DIR/huggingface"
+export UV_CACHE_DIR="$PHASE_A_CACHE_DIR/uv"
+export TWO_BY_TWO_RUNS_DIR="$HOME/understand-2x2/runs"
+mkdir -p "$PHASE_A_CACHE_DIR" "$TWO_BY_TWO_RUNS_DIR"
+
+bash scripts/bootstrap_l4.sh
+source .venv/bin/activate
+nvidia-smi
+df -h "$PHASE_A_CACHE_DIR" "$TWO_BY_TWO_RUNS_DIR"
+```
+
+Confirm where `$HOME` is mounted in the current Studio; a new Studio does not
+automatically contain an earlier cache. Create and save one run ID outside the repo.
+The committed prediction note is already frozen and `prepare` prints it for review:
+
+```bash
+export RUN_ID="understand-2x2-a100-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$HOME/understand-2x2"
+printf '%s\n' "$RUN_ID" > "$HOME/understand-2x2/active_run_id.txt"
+
+make 2x2-prepare RUN_ID="$RUN_ID" \
+  CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$TWO_BY_TWO_RUNS_DIR"
+# Only when the pinned target is absent or incomplete:
+make 2x2-prepare RUN_ID="$RUN_ID" \
+  CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$TWO_BY_TWO_RUNS_DIR" DOWNLOAD=1
+
+make 2x2-run RUN_ID="$RUN_ID" \
+  CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$TWO_BY_TWO_RUNS_DIR"
+make 2x2-export-audit RUN_ID="$RUN_ID" \
+  CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$TWO_BY_TWO_RUNS_DIR"
+```
+
+Use a persistent terminal such as tmux. Generation logs and checkpoints after every
+response. After reconnecting, restore the environment and reuse exactly the saved ID:
+
+```bash
+export RUN_ID="$(cat "$HOME/understand-2x2/active_run_id.txt")"
+make 2x2-run RUN_ID="$RUN_ID" \
+  CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$TWO_BY_TWO_RUNS_DIR"
+```
+
+After all 80 outcomes, download the entire run folder as a backup and label from its
+`audit/` folder. GPU compute may stop at this point. Upload the completed CSV without
+changing its immutable columns, then import and analyze on any CPU machine holding a
+copy of the run:
+
+```bash
+make 2x2-import-audit RUN_ID="$RUN_ID" \
+  CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$TWO_BY_TWO_RUNS_DIR" \
+  LABELS="$HOME/topgun/human_labels_completed.csv"
+make 2x2-analyze RUN_ID="$RUN_ID" \
+  CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$TWO_BY_TWO_RUNS_DIR"
+```
+
+Label export and analysis never inspect the cache or GPU. Back up the updated whole
+run folder afterward; an ordinary folder download or `tar.gz` is sufficient.
