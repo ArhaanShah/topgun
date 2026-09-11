@@ -137,15 +137,24 @@ Verify:
 
 ### Create Run ID
 
+Runs prepared before the collection-validity fix are invalid. Check out the reviewed commit and create a fresh
+run ID; never resume an older prepared directory.
+
 ```bash
+cd ~/topgun
+git fetch origin
+git checkout <REVIEWED_SHA>
+test "$(git rev-parse HEAD)" = "<REVIEWED_SHA>"
+test -z "$(git status --porcelain)"
 export RUN_ID="evidence-followup-$(date -u +%Y%m%dT%H%M%SZ)"
 printf '%s\n' "$RUN_ID" > "$PHASE_A_ROOT/active_followup_run_id.txt"
 echo "Run ID: $RUN_ID"
 ```
 
-### Hardware Canary (Pre-flight Check)
+### Freeze production prompts
 
-Before full collection, run a technical canary to verify GPU capacity and output token handling:
+Preparation verifies the pinned artifact, loads its real tokenizer, and freezes exact rendered prompts and token
+counts. It performs no inference:
 
 ```bash
 make followup-prepare RUN_ID="$RUN_ID" CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$FOLLOWUP_RUNS_DIR"
@@ -193,6 +202,10 @@ Or run directly:
 ```bash
 make followup-run RUN_ID="$RUN_ID" CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$FOLLOWUP_RUNS_DIR"
 ```
+
+`followup-run` repeats the clean-SHA, frozen-file, artifact, tokenizer, rendered-schedule, A100-capacity,
+package/runtime, and 8,192-context checks. It then runs a normal canary and a separate forced 4,096-token stress
+canary. Experimental generation starts only if both pass; canary overrides are never used for study responses.
 
 **Output:**
 - Progress updates after each response (generation order, ETA, wall duration)
@@ -360,7 +373,8 @@ vLLM context is too large or batch size misconfigured. Check:
 make followup-status RUN_ID="$RUN_ID" CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$FOLLOWUP_RUNS_DIR"
 ```
 
-If needed, manually reduce `max_model_len` in the profile (not recommended; contact researcher).
+Do not reduce `max_model_len` or alter sampling, profile, prompts, or the lockfile. Any change requires a new
+commit and a fresh run ID.
 
 ### Collection interrupted, no data loss
 

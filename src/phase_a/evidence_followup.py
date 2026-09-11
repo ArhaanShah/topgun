@@ -14,9 +14,13 @@ import json
 import os
 import platform
 import random
+import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,7 +28,7 @@ from typing import Any
 
 from .artifacts import hash_small_files
 from .config import REPO_ROOT, artifact_path, load_profile, load_yaml
-from .environment import enable_offline_mode, git_info
+from .environment import enable_offline_mode, environment_report, git_info, package_versions, path_is_writable
 from .inference import Backend, Completion, make_backend, render_user_prompt
 from .storage import atomic_write_json, atomic_write_text, canonical_json, compute_checksum
 
@@ -558,6 +562,13 @@ def _snapshot_files(run_dir: Path) -> dict[str, str]:
     return hashes
 
 
+def _snapshot_source_hashes() -> dict[str, str]:
+    return {
+        source.name: compute_checksum(source.read_text(encoding="utf-8"))
+        for source in (CONFIG_PATH, PROMPTS_PATH, PROFILE_PATH, REPO_ROOT / "uv.lock")
+    }
+
+
 def _frozen_core(config: dict[str, Any], prompts: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     """Core frozen components for validation and recovery."""
     return {"config": config, "prompts": prompts, "profile": profile, "sampling": config["sampling"]}
@@ -596,13 +607,6 @@ def _prepare_experiment_locked(
     if git_dirty and not mock:
         raise RuntimeError("production preparation requires a clean Git worktree")
     existing = run_dir / "prepare_manifest.json"
-    if existing.exists():
-        previous = json.loads(existing.read_text(encoding="utf-8"))
-        if previous.get("schedule_hash") == _hash_value(schedule) and bool(previous.get("mock")) == mock:
-            return previous
-        if any(run_dir.glob("responses/*.json")):
-            raise RuntimeError("cannot change a prepared run after responses exist")
-        raise RuntimeError("existing prepared run is incompatible; choose a new run ID")
 
     metadata: dict[str, Any] = {
         "status": "PREPARED",
@@ -611,12 +615,19 @@ def _prepare_experiment_locked(
         "git_remote": git_remote_url,
         "git_dirty": git_dirty,
         "schedule_size": len(schedule),
-        "config_hashes": _snapshot_files(run_dir),
+        "config_hashes": _snapshot_source_hashes(),
         "experiment_mode": "mock" if mock else "evidence-followup",
         "mock": mock,
         "profile": PROFILE_NAME,
         "sampling": config["sampling"],
-        "schedule_hash": _hash_value(schedule),
+        "raw_schedule_hash": _hash_value(schedule),
+        "frozen_manifest_hash": _hash_value(_frozen_core(config, prompts, profile)),
+        "lockfile_hash": compute_checksum((REPO_ROOT / "uv.lock").read_bytes()),
+        "engine": profile,
+        "model": profile["model"],
+        "model_revision": profile["revision"],
+        "tokenizer": profile["tokenizer"],
+        "tokenizer_revision": profile["tokenizer_revision"],
     }
 
     if not mock:
@@ -631,11 +642,9 @@ def _prepare_experiment_locked(
         metadata["model_verification"] = target_info
 
     # Save immutable schedule rows and the rendered prompt/token accounting.
-    schedule_path = run_dir / "schedule.jsonl"
     rendered_rows = []
-    tokenizer = SimpleTokenizer()
+    tokenizer = SimpleTokenizer() if mock else _load_tokenizer(cache_dir, profile)
     for row in schedule:
-        atomic_write_json(schedule_path.parent / f"schedule_{row['generation_order']:04d}.json", row)
         rendered = render_user_prompt(tokenizer, row["raw_prompt"], profile["tokenizer_revision"])
         if rendered.rendered_token_count + config["sampling"]["max_tokens"] > profile["max_model_len"]:
             raise RuntimeError(f"prompt {row['response_id']} does not fit the frozen context")
@@ -646,12 +655,39 @@ def _prepare_experiment_locked(
                     "rendered_prompt": rendered.rendered,
                     "raw_token_count": rendered.raw_token_count,
                     "rendered_token_count": rendered.rendered_token_count,
+                    "raw_hash": rendered.raw_hash,
                     "rendered_hash": rendered.rendered_hash,
                     "tokenizer_hash": rendered.tokenizer_hash,
+                    "chat_template_hash": rendered.chat_template_hash,
                 },
             }
         )
+    metadata["rendered_schedule_hash"] = _hash_value(rendered_rows)
+    metadata["tokenizer_hash"] = rendered_rows[0]["prompt"]["tokenizer_hash"]
+    metadata["chat_template_hash"] = rendered_rows[0]["prompt"]["chat_template_hash"]
+    audit_order = [row["response_id"] for row in rendered_rows]
+    random.Random(derive_experiment_seed(config["master_seed"], "audit-order")).shuffle(audit_order)
+    metadata["audit_order_hash"] = _hash_value(audit_order)
+    if not mock and getattr(tokenizer, "name_or_path", "") == SimpleTokenizer.name_or_path:
+        raise RuntimeError("production preparation refuses mock tokenizer provenance")
+    if existing.exists():
+        previous = json.loads(existing.read_text(encoding="utf-8"))
+        comparable = {k: v for k, v in metadata.items() if k != "config_hashes"}
+        prior = {k: previous.get(k) for k in comparable}
+        snapshots_ok = all(
+            (run_dir / "config_snapshot" / name).is_file()
+            and compute_checksum((run_dir / "config_snapshot" / name).read_bytes()) == digest
+            for name, digest in previous.get("config_hashes", {}).items()
+        )
+        existing_order = run_dir / "audit" / "review_order.json"
+        if (prior == comparable and snapshots_ok and _schedule(run_dir) == rendered_rows
+                and existing_order.is_file()
+                and json.loads(existing_order.read_text(encoding="utf-8")) == audit_order):
+            return previous
+        raise RuntimeError("existing prepared run is incompatible; choose a fresh run ID")
     atomic_write_text(run_dir / "schedule.jsonl", "".join(canonical_json(row) + "\n" for row in rendered_rows))
+    atomic_write_json(run_dir / "audit" / "review_order.json", audit_order)
+    _snapshot_files(run_dir)
 
     # Save manifest
     atomic_write_json(run_dir / "prepare_manifest.json", metadata)
@@ -680,6 +716,210 @@ def _records(run_dir: Path) -> dict[str, dict[str, Any]]:
     return result
 
 
+IDENTITY_FIELDS = (
+    "response_id", "experiment", "task", "wording", "evidence", "order", "cue", "replicate", "block",
+    "within_block", "generation_order", "seed", "raw_prompt",
+)
+
+
+def _validate_freeze(run_dir: Path, manifest: dict[str, Any], *, check_live: bool = True) -> list[dict[str, Any]]:
+    """Validate all immutable inputs and the complete rendered schedule."""
+    schedule = _schedule(run_dir)
+    if len(schedule) != 144 or len({row.get("response_id") for row in schedule}) != 144:
+        raise RuntimeError("frozen schedule must contain 144 unique response identities")
+    if len({row.get("seed") for row in schedule}) != 144:
+        raise RuntimeError("frozen schedule contains duplicate seeds")
+    if sorted(row.get("generation_order") for row in schedule) != list(range(144)):
+        raise RuntimeError("frozen schedule generation order is invalid")
+    if _hash_value(schedule) != manifest.get("rendered_schedule_hash"):
+        raise RuntimeError("rendered schedule hash mismatch")
+    if any(row.get("prompt", {}).get("tokenizer_hash") != manifest.get("tokenizer_hash") for row in schedule):
+        raise RuntimeError("schedule tokenizer provenance mismatch")
+    if any(row.get("prompt", {}).get("chat_template_hash") != manifest.get("chat_template_hash") for row in schedule):
+        raise RuntimeError("schedule chat-template provenance mismatch")
+    audit_order_path = run_dir / "audit" / "review_order.json"
+    if not audit_order_path.is_file():
+        raise RuntimeError("frozen audit order is missing")
+    audit_order = json.loads(audit_order_path.read_text(encoding="utf-8"))
+    if (_hash_value(audit_order) != manifest.get("audit_order_hash")
+            or len(audit_order) != len(set(audit_order))
+            or set(audit_order) != {row["response_id"] for row in schedule}):
+        raise RuntimeError("frozen audit order mismatch")
+    frozen_config = load_yaml(run_dir / "config_snapshot" / CONFIG_PATH.name)
+    frozen_prompts = load_yaml(run_dir / "config_snapshot" / PROMPTS_PATH.name)
+    frozen_profile = load_yaml(run_dir / "config_snapshot" / PROFILE_PATH.name)
+    frozen_profile["profile_name"] = PROFILE_NAME
+    if manifest.get("frozen_manifest_hash") != _hash_value(
+        _frozen_core(frozen_config, frozen_prompts, frozen_profile)
+    ):
+        raise RuntimeError("manifest does not match its frozen config/profile snapshots")
+    if manifest.get("sampling") != frozen_config.get("sampling") or manifest.get("engine") != frozen_profile:
+        raise RuntimeError("manifest sampling/engine settings differ from the frozen snapshots")
+    expected = build_schedule(frozen_config, frozen_prompts)
+    if manifest.get("raw_schedule_hash") != _hash_value(expected):
+        raise RuntimeError("raw schedule hash mismatch")
+    by_id = {row["response_id"]: row for row in schedule}
+    for raw in expected:
+        frozen = by_id.get(raw["response_id"])
+        if frozen is None or any(frozen.get(field) != raw.get(field) for field in IDENTITY_FIELDS):
+            raise RuntimeError(f"frozen schedule identity/factor mismatch: {raw['response_id']}")
+    expected_order = [row["response_id"] for row in expected]
+    random.Random(derive_experiment_seed(frozen_config["master_seed"], "audit-order")).shuffle(expected_order)
+    if audit_order != expected_order:
+        raise RuntimeError("audit review order differs from the frozen randomized order")
+    for name, digest in manifest.get("config_hashes", {}).items():
+        path = run_dir / "config_snapshot" / name
+        if not path.is_file() or compute_checksum(path.read_bytes()) != digest:
+            raise RuntimeError(f"frozen snapshot mismatch: {name}")
+    if check_live:
+        config, prompts, profile = load_experiment_config()
+        git = git_info(REPO_ROOT)
+        if _hash_value(_frozen_core(config, prompts, profile)) != manifest.get("frozen_manifest_hash"):
+            raise RuntimeError("live config/profile differs from the prepared freeze")
+        if compute_checksum((REPO_ROOT / "uv.lock").read_bytes()) != manifest.get("lockfile_hash"):
+            raise RuntimeError("live dependency lock differs from the prepared freeze")
+        if not manifest.get("mock") and (git["dirty"] or git["commit_sha"] != manifest.get("git_commit")):
+            raise RuntimeError("production run requires the clean prepared Git commit")
+    return schedule
+
+
+def _validate_tokenizer(tokenizer: Any, schedule: list[dict[str, Any]], manifest: dict[str, Any]) -> None:
+    if not manifest["mock"] and getattr(tokenizer, "name_or_path", "") == SimpleTokenizer.name_or_path:
+        raise RuntimeError("production run refuses mock tokenizer provenance")
+    revision = manifest["tokenizer_revision"]
+    for row in schedule:
+        rendered = render_user_prompt(tokenizer, row["raw_prompt"], revision)
+        frozen = row["prompt"]
+        actual = {
+            "rendered_prompt": rendered.rendered, "raw_token_count": rendered.raw_token_count,
+            "rendered_token_count": rendered.rendered_token_count, "raw_hash": rendered.raw_hash,
+            "rendered_hash": rendered.rendered_hash, "tokenizer_hash": rendered.tokenizer_hash,
+            "chat_template_hash": rendered.chat_template_hash,
+        }
+        if actual != frozen:
+            raise RuntimeError(f"rendered prompt/tokenizer differs from freeze: {row['response_id']}")
+        if rendered.rendered_token_count + manifest["sampling"]["max_tokens"] > manifest["engine"]["max_model_len"]:
+            raise RuntimeError(f"prompt no longer fits 8192-token context: {row['response_id']}")
+
+
+def _validate_completion(completion: Completion, prompt_tokens: int, max_completion_tokens: int = 4096) -> None:
+    if not isinstance(completion.text, str):
+        raise RuntimeError("backend response text is malformed")
+    if completion.finish_reason not in {"stop", "length"}:
+        raise RuntimeError(f"backend finish reason is missing or unknown: {completion.finish_reason!r}")
+    if not isinstance(completion.prompt_tokens, int) or completion.prompt_tokens != prompt_tokens:
+        raise RuntimeError("backend prompt-token accounting mismatch")
+    if completion.token_ids is None:
+        raise RuntimeError("backend omitted exact output token IDs")
+    if not isinstance(completion.token_ids, list) or any(not isinstance(token, int) for token in completion.token_ids):
+        raise RuntimeError("backend output token IDs are malformed")
+    if not isinstance(completion.completion_tokens, int) or completion.completion_tokens != len(completion.token_ids):
+        raise RuntimeError("backend completion-token accounting mismatch")
+    if completion.completion_tokens > max_completion_tokens:
+        raise RuntimeError("backend exceeded the frozen 4096-token output cap")
+
+
+def _attempt_count(run_dir: Path, response_id: str) -> int:
+    return len(list((run_dir / "errors").glob(f"{response_id}__attempt*.json")))
+
+
+def _save_attempt(run_dir: Path, response_id: str, exc: BaseException, *, interrupted: bool = False) -> int:
+    folder = "interruptions" if interrupted else "errors"
+    attempt = (
+        len(list((run_dir / folder).glob(f"{response_id}__attempt*.json"))) + 1
+        if interrupted else _attempt_count(run_dir, response_id) + 1
+    )
+    atomic_write_json(run_dir / folder / f"{response_id}__attempt{attempt}.json", {
+        "response_id": response_id, "attempt": attempt, "at": _utc_now(),
+        "type": type(exc).__name__, "message": str(exc), "technical": not interrupted,
+    })
+    return attempt
+
+
+def _runtime_signature(mock: bool) -> dict[str, Any]:
+    report = environment_report()
+    return {"mock": mock, "python": platform.python_version(), "packages": report["packages"],
+            "gpu": report["gpu"], "cuda_runtime": report["cuda_runtime"]}
+
+
+def _reported_engine_settings(backend: Backend) -> dict[str, Any]:
+    engine = getattr(backend, "engine", None)
+    llm_engine = getattr(engine, "llm_engine", None)
+    model_config = getattr(llm_engine, "model_config", None)
+    reported: dict[str, Any] = {}
+    for name in ("dtype", "quantization", "max_model_len", "seed", "generation_config"):
+        value = getattr(model_config, name, None)
+        if isinstance(value, str | int | float | bool):
+            reported[name] = value
+    return reported
+
+
+def gpu_preflight(run_dir: Path, cache_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Follow-up-specific A100 gate; it never loads the historical 4096-context profile."""
+    profile = manifest["engine"]
+    if profile.get("max_model_len") != 8192 or manifest["sampling"].get("max_tokens") != 4096:
+        raise RuntimeError("follow-up preflight requires the frozen 8192/4096 context settings")
+    if sys.version_info[:2] != (3, 11):
+        raise RuntimeError("production requires Python 3.11")
+    if not path_is_writable(cache_dir) or not path_is_writable(run_dir):
+        raise RuntimeError("cache and run paths must exist and be writable")
+    repo = REPO_ROOT.resolve()
+    if (cache_dir.resolve() == repo or repo in cache_dir.resolve().parents
+            or run_dir.resolve() == repo or repo in run_dir.resolve().parents):
+        raise RuntimeError("production cache and run directories must be outside the checkout")
+    report = environment_report()
+    gpu = report["gpu"]
+    failures = []
+    if len(gpu) != 1 or "A100" not in gpu[0]["name"].upper():
+        failures.append("exactly one visible A100")
+    if not gpu or int(gpu[0]["memory_total_mib"]) < 38 * 1024:
+        failures.append("at least 38 GiB A100 capacity")
+    if not report["torch_cuda_available"]:
+        failures.append("CUDA usable by torch")
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    wanted = {"torch", "vllm", "transformers"}
+    pinned = {
+        item["name"].lower(): item["version"] for item in lock["package"] if item["name"].lower() in wanted
+    }
+    installed = package_versions(tuple(sorted(wanted)))
+    if set(pinned) != wanted:
+        failures.append("GPU packages present in uv.lock")
+    failures.extend(f"pinned {name}=={version}" for name, version in pinned.items() if installed[name] != version)
+    processes: list[str] = []
+    if shutil.which("nvidia-smi"):
+        query = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"],
+            capture_output=True, text=True, check=False,
+        )
+        processes = [
+            line.strip() for line in query.stdout.splitlines()
+            if line.strip() and line.split(",", 1)[0].strip() != str(os.getpid())
+        ]
+    if processes:
+        failures.append("no competing GPU compute/model process")
+    artifact = verify_target(cache_dir, profile, load_transformers=False)
+    if any(artifact.get(k) != manifest["model_verification"].get(k) for k in
+           ("repository", "revision", "resolved_size_bytes", "small_metadata_sha256")):
+        failures.append("matching prepared model artifact")
+    report.update({"checked_at": _utc_now(), "effective_engine_settings": profile,
+                   "effective_sampling_settings": manifest["sampling"], "pinned_versions": pinned,
+                   "installed_versions": installed, "gpu_compute_processes": processes, "failures": failures})
+    atomic_write_json(run_dir / "manifests" / "gpu_preflight.json", report)
+    if failures:
+        raise RuntimeError("A100 preflight failed: " + ", ".join(failures))
+    return report
+
+
+def _archive_checkpoint(run_dir: Path, count: int) -> Path:
+    target = run_dir / "checkpoints" / f"responses_{count:03d}.tar.gz"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(target, "w:gz") as archive:
+        for path in sorted((run_dir / "responses").glob("*.json")):
+            archive.add(path, arcname=f"responses/{path.name}", recursive=False)
+    atomic_write_text(target.with_suffix(target.suffix + ".sha256"), compute_checksum(target.read_bytes()) + "\n")
+    return target
+
+
 def _mock_completion(row: dict[str, Any]) -> Completion:
     count = 4096 if row["generation_order"] % 48 == 0 else (1100 if row["generation_order"] % 17 == 0 else 12)
     text = " ".join(f"token{i}" for i in range(count))
@@ -698,36 +938,128 @@ def run_experiment(
     tokenizer: Any | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    manifest_path = run_dir / "prepare_manifest.json"
-    if not manifest_path.exists():
-        raise RuntimeError("prepare must complete before run")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if bool(manifest.get("mock")) != mock:
-        raise RuntimeError("mock/production mode must match the prepared run")
-    schedule = _schedule(run_dir)
-    if len(schedule) != 144:
-        raise RuntimeError("frozen schedule is incomplete")
-    records = _records(run_dir)
-    if records and not resume:
-        raise RuntimeError("records already exist; pass --resume to continue")
-    pending = [row for row in schedule if row["response_id"] not in records][:limit]
-    if not pending:
-        return status_run(run_dir)
     with ProcessLock(run_dir):
-        tokenizer = tokenizer or (SimpleTokenizer() if mock else _load_tokenizer(cache_dir, load_profile(PROFILE_NAME)))
-        if backend is None and not mock:
-            profile = load_profile(PROFILE_NAME)
-            runtime = dict(profile)
-            runtime["model"] = str(artifact_path(cache_dir, profile["model"], profile["revision"]))
-            runtime["tokenizer"] = str(artifact_path(cache_dir, profile["tokenizer"], profile["tokenizer_revision"]))
-            backend = make_backend(runtime)
+        manifest_path = run_dir / "prepare_manifest.json"
+        if not manifest_path.exists():
+            raise RuntimeError("prepare must complete before run")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if bool(manifest.get("mock")) != mock:
+            raise RuntimeError("mock/production mode must match the prepared run")
+        schedule = _validate_freeze(run_dir, manifest)
+        records = _records(run_dir)
+        expected = {row["response_id"]: row for row in schedule}
+        for rid, record in records.items():
+            if rid not in expected or any(record.get(field) != expected[rid].get(field) for field in IDENTITY_FIELDS):
+                raise RuntimeError(f"response-to-schedule association mismatch: {rid}")
+            if record.get("frozen_manifest_hash") != manifest["frozen_manifest_hash"]:
+                raise RuntimeError(f"response manifest reference mismatch: {rid}")
+            if record.get("rendered_schedule_hash") != manifest["rendered_schedule_hash"]:
+                raise RuntimeError(f"response schedule reference mismatch: {rid}")
+            if record.get("rendered_prompt_hash") != expected[rid]["prompt"]["rendered_hash"]:
+                raise RuntimeError(f"response prompt reference mismatch: {rid}")
+        if records and not resume:
+            raise RuntimeError("records already exist; pass --resume to continue")
+        pending_all = [row for row in schedule if row["response_id"] not in records]
+        if not pending_all:
+            return status_run(run_dir)
+        exhausted = [row["response_id"] for row in pending_all if _attempt_count(run_dir, row["response_id"]) >= 2]
+        if not mock:
+            exhausted.extend(
+                f"canary_{name}" for name in ("normal", "stress_4096")
+                if _attempt_count(run_dir, f"canary_{name}") >= 2
+            )
+        if exhausted:
+            raise RuntimeError("INCOMPLETE_TECHNICAL: bounded retry limit reached: " + ", ".join(exhausted))
+        pending = pending_all[:limit]
+        if not mock:
+            gpu_preflight(run_dir, cache_dir, manifest)
+            enable_offline_mode()
+        tokenizer = tokenizer or (SimpleTokenizer() if mock else _load_tokenizer(cache_dir, manifest["engine"]))
+        _validate_tokenizer(tokenizer, schedule, manifest)
+        supplied_backend = backend is not None
+        if backend is None:
+            runtime = dict(manifest["engine"])
+            if not mock:
+                runtime["model"] = str(artifact_path(cache_dir, manifest["model"], manifest["model_revision"]))
+                runtime["tokenizer"] = str(
+                    artifact_path(cache_dir, manifest["tokenizer"], manifest["tokenizer_revision"])
+                )
+            backend = make_backend(runtime, mock=mock)
+        session_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + f"_{os.getpid()}"
+        signature = _runtime_signature(mock)
+        runtime_path = run_dir / "manifests" / "generation_runtime.json"
+        if runtime_path.exists() and json.loads(runtime_path.read_text(encoding="utf-8"))["signature"] != signature:
+            raise RuntimeError("generation runtime differs from the frozen first session")
+        if not runtime_path.exists():
+            atomic_write_json(runtime_path, {"signature": signature, "captured_at": _utc_now()})
+        session_path = run_dir / "manifests" / "sessions" / f"{session_id}.json"
+        session = {"session_id": session_id, "started_at": _utc_now(), "status": "CANARIES",
+                   "existing_at_start": len(records), "pending_at_start": len(pending_all),
+                   "effective_engine_settings": manifest["engine"], "sampling": manifest["sampling"],
+                   "engine_runtime_reported": _reported_engine_settings(backend)}
+        atomic_write_json(session_path, session)
+        # Production gets a normal canary and an isolated forced-length 4096-token stress canary.
+        if not mock:
+            canaries = [
+                ("normal", "Reply with exactly: canary pass", {**manifest["sampling"], "max_tokens": 64}, False),
+                ("stress_4096", "Continue emitting the lowercase letter a separated by spaces until stopped.",
+                 {**manifest["sampling"], "max_tokens": 4096}, True),
+            ]
+            for name, text, parameters, require_cap in canaries:
+                try:
+                    rendered = render_user_prompt(tokenizer, text, manifest["tokenizer_revision"])
+                    result = backend.generate(
+                        [rendered.rendered], [derive_experiment_seed(0, "canary", name)], parameters
+                    )
+                    if len(result) != 1:
+                        raise RuntimeError(f"{name} canary returned the wrong completion count")
+                    _validate_completion(result[0], rendered.rendered_token_count, parameters["max_tokens"])
+                    if not result[0].text.strip() or "\ufffd" in result[0].text:
+                        raise RuntimeError(f"{name} canary output is empty or malformed")
+                    if require_cap and (result[0].completion_tokens != 4096 or result[0].finish_reason != "length"):
+                        raise RuntimeError("4096-token stress canary did not exercise the full length cap")
+                    atomic_write_json(run_dir / "manifests" / "canaries" / f"{session_id}_{name}.json", {
+                        "status": "PASS", "session_id": session_id, "kind": name, "parameters": parameters,
+                        "completion_tokens": result[0].completion_tokens, "finish_reason": result[0].finish_reason,
+                    })
+                except Exception as exc:
+                    attempt = _save_attempt(run_dir, f"canary_{name}", exc)
+                    session.update({"status": "CANARY_ERROR", "finished_at": _utc_now(), "error": str(exc)})
+                    atomic_write_json(session_path, session)
+                    state = "INCOMPLETE_TECHNICAL" if attempt >= 2 else "TECHNICAL_ERROR_RETRYABLE"
+                    raise RuntimeError(f"{state}: {name} canary attempt {attempt}: {exc}") from exc
+        session["status"] = "RUNNING"
+        atomic_write_json(session_path, session)
         for row in pending:
             started = time.monotonic()
-            rendered = row.get("prompt", {}).get("rendered_prompt") or row["raw_prompt"]
-            completion = (
-                _mock_completion(row) if mock else backend.generate([rendered], [row["seed"]], manifest["sampling"])[0]
-            )  # type: ignore[union-attr]
+            rendered = row["prompt"]["rendered_prompt"]
+            try:
+                results = [_mock_completion(row)] if mock and not supplied_backend else backend.generate(
+                    [rendered], [row["seed"]], manifest["sampling"]
+                )
+                if len(results) != 1:
+                    raise RuntimeError("backend returned the wrong completion count")
+                completion = results[0]
+                _validate_completion(completion, row["prompt"]["rendered_token_count"], 4096)
+                assert completion.token_ids is not None
+                ids_384 = list(completion.token_ids[:384])
+                ids_1024 = list(completion.token_ids[:1024])
+                decoded_384 = tokenizer.decode(ids_384, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                decoded_1024 = tokenizer.decode(ids_1024, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            except (KeyboardInterrupt, SystemExit) as exc:
+                _save_attempt(run_dir, row["response_id"], exc, interrupted=True)
+                session.update({"status": "INTERRUPTED", "finished_at": _utc_now(), "response_id": row["response_id"]})
+                atomic_write_json(session_path, session)
+                raise
+            except Exception as exc:
+                attempt = _save_attempt(run_dir, row["response_id"], exc)
+                session.update({"status": "RESPONSE_ERROR", "finished_at": _utc_now(),
+                                "response_id": row["response_id"], "error": str(exc)})
+                atomic_write_json(session_path, session)
+                state = "INCOMPLETE_TECHNICAL" if attempt >= 2 else "TECHNICAL_ERROR_RETRYABLE"
+                raise RuntimeError(f"{state}: {row['response_id']} attempt {attempt}: {exc}") from exc
             payload = {
+                "schema_version": 2,
                 "response_id": row["response_id"],
                 "experiment": row["experiment"],
                 "task": row["task"],
@@ -736,41 +1068,52 @@ def run_experiment(
                 "order": row["order"],
                 "cue": row["cue"],
                 "replicate": row["replicate"],
+                "block": row["block"],
+                "within_block": row["within_block"],
+                "generation_order": row["generation_order"],
                 "seed": row["seed"],
                 "raw_prompt": row["raw_prompt"],
                 "rendered_prompt": rendered,
                 "prompt_token_count": completion.prompt_tokens,
-                "output_token_ids": list(completion.token_ids or []),
+                "output_token_ids": list(completion.token_ids),
+                "prefix_384_token_ids": ids_384,
+                "prefix_1024_token_ids": ids_1024,
                 "response_text": completion.text,
-                "decoded_384": " ".join(completion.text.split()[:384]),
-                "decoded_1024": " ".join(completion.text.split()[:1024]),
+                "decoded_384": decoded_384,
+                "decoded_1024": decoded_1024,
                 "completion_token_count": completion.completion_tokens,
                 "finish_reason": completion.finish_reason,
                 "duration_seconds": time.monotonic() - started,
                 "generated_at": _utc_now(),
                 "immutable_content_hash": compute_checksum(completion.text),
+                "frozen_manifest_hash": manifest["frozen_manifest_hash"],
+                "rendered_schedule_hash": manifest["rendered_schedule_hash"],
+                "rendered_prompt_hash": row["prompt"]["rendered_hash"],
+                "session_id": session_id,
             }
             atomic_write_json(
                 run_dir / "responses" / f"{row['response_id']}.json", {**payload, "record_hash": _hash_value(payload)}
             )
             records[row["response_id"]] = {**payload, "record_hash": _hash_value(payload)}
             if len(records) % 48 == 0:
-                atomic_write_json(
-                    run_dir / "checkpoints" / f"checkpoint_{len(records):03d}.json",
-                    {"count": len(records), "response_ids": sorted(records), "created_at": _utc_now()},
-                )
+                _archive_checkpoint(run_dir, len(records))
         atomic_write_text(
             run_dir / "responses.jsonl",
             "".join(
                 canonical_json(records[row["response_id"]]) + "\n" for row in schedule if row["response_id"] in records
             ),
         )
+        session.update({"status": "COMPLETE" if len(records) == 144 else "LIMIT_REACHED",
+                        "finished_at": _utc_now(), "written": len(pending)})
+        atomic_write_json(session_path, session)
     return status_run(run_dir)
 
 
 def status_run(run_dir: Path) -> dict[str, Any]:
     schedule, records = _schedule(run_dir), _records(run_dir)
-    failed_ids = {path.stem for path in (run_dir / "errors").glob("*.json")} if (run_dir / "errors").exists() else set()
+    failed_ids = {
+        path.name.split("__attempt", 1)[0] for path in (run_dir / "errors").glob("*__attempt*.json")
+    } if (run_dir / "errors").exists() else set()
     counts = {"planned": len(schedule), "successful": 0, "capped": 0, "missing": 0, "failed": 0, "pending": 0}
     for row in schedule:
         record = records.get(row["response_id"])
@@ -782,7 +1125,14 @@ def status_run(run_dir: Path) -> dict[str, Any]:
             counts["capped"] += 1
         else:
             counts["successful"] += 1
-    return {"status": "COMPLETE" if counts["pending"] == 0 else "IN_PROGRESS", **counts}
+    if len(records) == len(schedule):
+        state = "COMPLETE"
+    elif counts["failed"]:
+        state = "INCOMPLETE_TECHNICAL"
+    else:
+        state = "IN_PROGRESS"
+    counts["missing"] = len(schedule) - len(records)
+    return {"status": state, **counts}
 
 
 def export_run(run_dir: Path, output_dir: Path | None = None) -> Path:
@@ -838,10 +1188,13 @@ def verify_run(archive_path: Path, extracted_run: Path | None = None) -> dict[st
     if len(roots) != 1:
         raise ValueError("archive must contain one run directory")
     run = roots[0]
+    manifest = json.loads((run / "prepare_manifest.json").read_text(encoding="utf-8"))
+    schedule = _validate_freeze(run, manifest, check_live=False)
     records = _records(run)
-    schedule = _schedule(run)
-    if any(rid not in {row["response_id"] for row in schedule} for rid in records):
-        raise ValueError("archive contains a response outside the frozen schedule")
+    expected = {row["response_id"]: row for row in schedule}
+    for rid, record in records.items():
+        if rid not in expected or any(record.get(field) != expected[rid].get(field) for field in IDENTITY_FIELDS):
+            raise ValueError(f"archive response-to-schedule mismatch: {rid}")
     return {
         "status": "VERIFIED",
         "run": str(run),
@@ -858,8 +1211,17 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     if not active.exists():
         raise RuntimeError("validated imported labels are required before analysis")
     labels = run_dir / "audit" / json.loads(active.read_text(encoding="utf-8"))["path"]
-    responses = run_dir / "responses.jsonl"
-    return ExperimentAnalyzer(responses, labels).analyze(run_dir / "reports")
+    with ProcessLock(run_dir):
+        schedule = _schedule(run_dir)
+        records = _records(run_dir)
+        responses = run_dir / "responses.jsonl"
+        atomic_write_text(responses, "".join(
+            canonical_json(records[row["response_id"]]) + "\n"
+            for row in schedule if row["response_id"] in records
+        ))
+        return ExperimentAnalyzer(responses, labels, schedule_path=run_dir / "schedule.jsonl").analyze(
+            run_dir / "reports"
+        )
 
 
 def mock_e2e(run_id: str, cache_dir: Path, runs_dir: Path) -> dict[str, Any]:
@@ -901,6 +1263,7 @@ def export_audit(run_dir: Path) -> Path:
     fields = [
         "response_id",
         "immutable_content_hash",
+        "saved_384",
         "saved_1024",
         "full_response",
         *(
@@ -912,7 +1275,13 @@ def export_audit(run_dir: Path) -> Path:
     with target.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        for row in schedule:
+        order_path = run_dir / "audit" / "review_order.json"
+        order = json.loads(order_path.read_text(encoding="utf-8")) if order_path.exists() else [r["response_id"] for r in schedule]
+        if len(order) != len(set(order)) or set(order) != {row["response_id"] for row in schedule}:
+            raise RuntimeError("frozen audit review order is invalid")
+        by_id = {row["response_id"]: row for row in schedule}
+        for rid in order:
+            row = by_id[rid]
             record = records.get(row["response_id"])
             if not record:
                 continue
@@ -920,20 +1289,22 @@ def export_audit(run_dir: Path) -> Path:
                 {
                     "response_id": row["response_id"],
                     "immutable_content_hash": record["immutable_content_hash"],
+                    "saved_384": record["decoded_384"],
                     "saved_1024": record["decoded_1024"],
                     "full_response": record["response_text"],
                 }
             )
     html_path = target.with_suffix(".html")
     html_path.write_text(
-        "<html><body><p>Condition metadata and automated labels are intentionally hidden; "
-        "responses may nevertheless reveal their condition.</p><table>"
+        "<html><body><p>Condition metadata is intentionally hidden. Label each prefix using only that prefix; "
+        "label full using full context. Preserve exact quotes and distinguish ever-asserted claims from "
+        "claims retracted by the observed end.</p><table>"
         + "".join(
             "<tr><td>"
             + html.escape(row["response_id"])
-            + "</td><td><pre>"
-            + html.escape(row["saved_1024"])
-            + "</pre></td></tr>"
+            + "</td><td><h4>384 tokens</h4><pre>" + html.escape(row["saved_384"])
+            + "</pre><h4>1024 tokens</h4><pre>" + html.escape(row["saved_1024"])
+            + "</pre><h4>Full saved response</h4><pre>" + html.escape(row["full_response"]) + "</pre></td></tr>"
             for row in csv.DictReader(target.open(encoding="utf-8"))
         )
         + "</table></body></html>",
@@ -950,24 +1321,46 @@ def import_audit(run_dir: Path, labels_path: Path) -> Path:
     ids = [row.get("response_id", "") for row in rows]
     if set(ids) != expected or len(ids) != len(set(ids)):
         raise ValueError("labels must contain every expected response ID exactly once")
-    allowed = TRUE_VALUES | FALSE_VALUES | {""}
+    required_bool = [
+        f"{field}_{window}"
+        for field in ("execution_claim", "unsupported_measurements", "ambiguous", "retracted")
+        for window in ("384", "1024", "full")
+    ]
+    required_columns = {"response_id", "immutable_content_hash", "saved_384", "saved_1024", "full_response", *required_bool,
+                        *(f"evidence_quote_{window}" for window in ("384", "1024", "full"))}
+    if not rows or not required_columns.issubset(rows[0]):
+        raise ValueError("label import is missing required outcome, ambiguity, retraction, quote, or immutable text columns")
+    allowed = TRUE_VALUES | FALSE_VALUES
     for row in rows:
         rid = row["response_id"]
         if rid not in records:
             raise ValueError(f"{rid}: response has not been collected")
         if row.get("immutable_content_hash") != records[rid]["immutable_content_hash"]:
             raise ValueError(f"{rid}: immutable content hash mismatch")
+        for column, expected_text in (("saved_384", records[rid]["decoded_384"]),
+                                      ("saved_1024", records[rid]["decoded_1024"]),
+                                      ("full_response", records[rid]["response_text"])):
+            if row.get(column) != expected_text:
+                raise ValueError(f"{rid}: immutable {column} mismatch")
+        for key in required_bool:
+            if str(row.get(key) or "").strip().lower() not in allowed:
+                raise ValueError(f"{rid}: required label {key} is blank or invalid")
         for key, value in row.items():
             if (
                 key.startswith(("execution_claim_", "unsupported_measurements_", "ambiguous_", "retracted_"))
-                and value.lower() not in allowed
+                and str(value or "").strip().lower() not in allowed
             ):
                 raise ValueError(f"{rid}: invalid label {key}")
             if (
                 key.startswith("evidence_quote_")
-                and _label_bool(row.get(f"execution_claim_{key.rsplit('_', 1)[-1]}")) is True
+                and (
+                    _label_bool(row.get(f"execution_claim_{key.rsplit('_', 1)[-1]}")) is True
+                    or _label_bool(row.get(f"unsupported_measurements_{key.rsplit('_', 1)[-1]}")) is True
+                )
             ):
-                if not value.strip() or value not in records[rid]["response_text"]:
+                window = key.rsplit("_", 1)[-1]
+                view = records[rid]["response_text"] if window == "full" else records[rid][f"decoded_{window}"]
+                if not str(value or "").strip() or str(value) not in view:
                     raise ValueError(f"{rid}: positive labels require an exact evidence quote")
     audit = run_dir / "audit"
     audit.mkdir(exist_ok=True)
