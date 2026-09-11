@@ -22,6 +22,7 @@ from phase_a.understand_2x2 import (
     load_experiment_config,
     load_response_records,
     prepare_experiment,
+    recover_stale_lock,
     render_raw_variants,
     run_experiment,
 )
@@ -198,6 +199,32 @@ def test_corruption_and_concurrent_writer_fail_loudly(tmp_path):
             pass
 
 
+def test_lock_recovery_refuses_live_owner_and_removes_verified_stale_lock(tmp_path):
+    _, run_dir = _prepared(tmp_path)
+    lock_path = run_dir / "manifests" / "writer.lock"
+    with ProcessLock(run_dir):
+        with pytest.raises(RuntimeError, match="still the owning process"):
+            recover_stale_lock(run_dir)
+        assert lock_path.exists()
+    lock_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pid": __import__("os").getpid(),
+                "process_create_time": 0,
+                "host": "old-studio",
+                "boot_id": "a-verified-different-boot",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = recover_stale_lock(run_dir)
+    assert result["status"] == "STALE_LOCK_REMOVED"
+    assert result["verification"] == "recorded operating-system boot has ended"
+    assert not lock_path.exists()
+
+
 def test_audit_is_blind_escaped_and_multiline_round_trips(tmp_path):
     cache, run_dir = _prepared(tmp_path)
     backend = CountingBackend()
@@ -213,6 +240,12 @@ def test_audit_is_blind_escaped_and_multiline_round_trips(tmp_path):
     first.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     export_audit(run_dir)
     html_text = (run_dir / "audit" / "audit_review.html").read_text(encoding="utf-8")
+    instructions = (run_dir / "audit" / "instructions.md").read_text(encoding="utf-8")
+    config, _, _ = load_experiment_config()
+    assert config["rubric"]["exclusions"] in instructions
+    for example in config["rubric"]["synthetic_examples"]:
+        assert example["text"] in instructions
+        assert f"execution_claim={str(example['execution_claim']).lower()}" in instructions
     assert "&lt;script&gt;" in html_text and "<script>alert" not in html_text
     with (run_dir / "audit" / "human_labels.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))

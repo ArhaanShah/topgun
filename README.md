@@ -157,6 +157,20 @@ make 2x2-run RUN_ID="$RUN_ID" \
   CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$TWO_BY_TWO_RUNS_DIR"
 ```
 
+If Lightning was hard-stopped while writing and the next invocation reports
+`writer.lock`, first ensure no generation process from that run is active, then use:
+
+```bash
+make 2x2-recover-lock RUN_ID="$RUN_ID" \
+  CACHE_DIR="$PHASE_A_CACHE_DIR" RUNS_DIR="$TWO_BY_TWO_RUNS_DIR"
+```
+
+This command does not offer a force option. It reads the recorded PID, process start
+time, and operating-system boot identity and removes the lock only after proving that
+the original process is gone (including a Studio reboot or PID reuse). It refuses to
+delete an active, malformed, unverifiable, or concurrently changed lock. After a
+successful recovery, rerun `make 2x2-run` with the same arguments and `RUN_ID`.
+
 After all 80 outcomes, download the entire run folder as a backup and label from its
 `audit/` folder. GPU compute may stop at this point. Upload the completed CSV without
 changing its immutable columns, then import and analyze on any CPU machine holding a

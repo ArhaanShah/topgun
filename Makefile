@@ -4,7 +4,7 @@ RUNS_DIR ?= $(if $(PHASE_A_RUNS_DIR),$(PHASE_A_RUNS_DIR),.phase_a_runs)
 CACHE_DIR ?= $(if $(PHASE_A_CACHE_DIR),$(PHASE_A_CACHE_DIR),.phase_a_cache)
 COMMON = --profile $(PROFILE) --runs-dir $(RUNS_DIR) --cache-dir $(CACHE_DIR) --run-id $(RUN_ID)
 
-.PHONY: test check format preflight download verify-offline prepare health-check canary smoke judge-smoke reproduce judge-reproduction export-audit finalize export-run mock-e2e 2x2-prepare 2x2-run 2x2-export-audit 2x2-import-audit 2x2-analyze
+.PHONY: test check format preflight download verify-offline prepare health-check canary smoke judge-smoke reproduce judge-reproduction export-audit finalize export-run mock-e2e 2x2-prepare 2x2-run 2x2-export-audit 2x2-import-audit 2x2-analyze 2x2-recover-lock
 
 test:
 	python -m pytest -q
@@ -79,3 +79,6 @@ mock-e2e:
 
 2x2-analyze:
 	python -m phase_a.understand_2x2 analyze $(2X2_COMMON)
+
+2x2-recover-lock:
+	python -m phase_a.understand_2x2 recover-lock $(2X2_COMMON)

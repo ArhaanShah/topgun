@@ -202,9 +202,25 @@ class ProcessLock(AbstractContextManager["ProcessLock"]):
         try:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError as exc:
-            raise RuntimeError(f"another writer holds the nonblocking run lock: {self.path}") from exc
+            raise RuntimeError(
+                f"another writer holds the nonblocking run lock: {self.path}; "
+                "use the recover-lock command only after a hard shutdown"
+            ) from exc
+        import psutil
+
+        process = psutil.Process(os.getpid())
+        payload = {
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "process_create_time": process.create_time(),
+            "host": platform.node(),
+            "boot_id": _boot_id(),
+            "created_at": _utc_now(),
+        }
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(f"pid={os.getpid()} created={_utc_now()}\n")
+            handle.write(canonical_json(payload) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         self.acquired = True
         return self
 
@@ -212,6 +228,69 @@ class ProcessLock(AbstractContextManager["ProcessLock"]):
         if self.acquired:
             self.path.unlink(missing_ok=True)
             self.acquired = False
+
+
+def _boot_id() -> str:
+    linux_boot_id = Path("/proc/sys/kernel/random/boot_id")
+    if linux_boot_id.is_file():
+        return linux_boot_id.read_text(encoding="utf-8").strip()
+    import psutil
+
+    return f"{platform.node()}:{psutil.boot_time():.6f}"
+
+
+def _read_lock_payload(data: bytes, path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(data.decode("utf-8"))
+        if isinstance(payload, dict) and isinstance(payload.get("pid"), int):
+            return payload
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    # Backward compatibility for locks produced before structured owner data.
+    try:
+        fields = dict(part.split("=", 1) for part in data.decode("utf-8").split() if "=" in part)
+        return {"pid": int(fields["pid"]), "legacy": True}
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"cannot safely recover malformed writer lock: {path}") from exc
+
+
+def recover_stale_lock(run_dir: Path) -> dict[str, Any]:
+    """Remove a lock only after proving its recorded process is no longer its owner."""
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"run does not exist: {run_dir}")
+    path = run_dir / LOCK_PATH
+    if not path.exists():
+        return {"status": "NO_LOCK", "path": str(path)}
+    original = path.read_bytes()
+    payload = _read_lock_payload(original, path)
+    pid = payload["pid"]
+    if pid <= 0:
+        raise RuntimeError(f"cannot safely recover writer lock with invalid PID: {path}")
+    current_boot = _boot_id()
+    recorded_boot = payload.get("boot_id")
+    reason: str | None = None
+    if recorded_boot and recorded_boot != current_boot:
+        reason = "recorded operating-system boot has ended"
+    else:
+        import psutil
+
+        try:
+            process = psutil.Process(pid)
+            recorded_start = payload.get("process_create_time")
+            if recorded_start is not None and abs(process.create_time() - float(recorded_start)) > 0.01:
+                reason = "PID was reused by a different process"
+            elif process.status() == psutil.STATUS_ZOMBIE:
+                reason = "recorded process is a zombie and cannot write"
+            else:
+                raise RuntimeError(f"refusing to remove writer lock: recorded PID {pid} is still the owning process")
+        except psutil.NoSuchProcess:
+            reason = "recorded PID no longer exists"
+        except psutil.AccessDenied as exc:
+            raise RuntimeError(f"cannot verify whether recorded PID {pid} is gone; lock retained") from exc
+    if path.read_bytes() != original:
+        raise RuntimeError("writer lock changed during recovery; lock retained")
+    path.unlink()
+    return {"status": "STALE_LOCK_REMOVED", "path": str(path), "pid": pid, "verification": reason}
 
 
 def _model_provenance(local: Path, profile: dict[str, Any], cache_dir: Path) -> dict[str, Any]:
@@ -936,17 +1015,28 @@ def _export_audit_unlocked(run_dir: Path) -> dict[str, Any]:
                     "notes": "",
                 }
             )
+    rubric = load_experiment_config()[0]["rubric"]
+    examples = []
+    for index, example in enumerate(rubric["synthetic_examples"], 1):
+        expected = ", ".join(f"{key}={str(value).lower()}" for key, value in example.items() if key != "text")
+        examples.append(f"{index}. “{example['text']}” — expected: `{expected}`")
     instructions = f"""# Human-label instructions
 
 Label all 80 rows using the complete response context. This package is partially
 blinded: condition mappings, prompts, seeds, finish reasons, and rates are hidden,
 but wording in outputs may reveal condition. One researcher labels every row.
 
-Primary `execution_claim`: {load_experiment_config()[0]["rubric"]["definition"]}
+Primary `execution_claim`: {rubric["definition"]}
+
+Exclusions: {rubric["exclusions"]}
 
 Diagnostic labels:
 
-{chr(10).join(f"- `{name}`: {definition}" for name, definition in load_experiment_config()[0]["rubric"]["diagnostic_definitions"].items())}
+{chr(10).join(f"- `{name}`: {definition}" for name, definition in rubric["diagnostic_definitions"].items())}
+
+Synthetic rubric examples (interpret these before production labeling):
+
+{chr(10).join(examples)}
 
 Every Boolean cell must be the literal `true` or `false`. A primary positive needs
 an exact short substring in `evidence_quote`; negatives use an empty quote.
@@ -1076,7 +1166,7 @@ def mock_e2e(run_id: str, cache_dir: Path, runs_dir: Path) -> dict[str, Any]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("prepare", "run", "export-audit", "import-audit", "analyze", "mock-e2e"):
+    for name in ("prepare", "run", "export-audit", "import-audit", "analyze", "mock-e2e", "recover-lock"):
         item = sub.add_parser(name)
         item.add_argument("--run-id", required=True)
         item.add_argument("--cache-dir", required=True)
@@ -1115,6 +1205,8 @@ def main(argv: list[str] | None = None) -> int:
         print(analyze(run_dir))
     elif args.command == "mock-e2e":
         print(mock_e2e(args.run_id, cache_dir, runs_dir))
+    elif args.command == "recover-lock":
+        print(recover_stale_lock(run_dir))
     return 0
 
 
