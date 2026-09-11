@@ -1,0 +1,9 @@
+paraphrase,evidence,code,variant_id,execution_claim_count,n,execution_claim_rate,wilson_95_low,wilson_95_high,mean_completion_tokens,length_cap_count,empty_output_count,specific_details_count,specific_details_rate,unsupported_measurements_count,unsupported_measurements_rate,gap_acknowledged_count,gap_acknowledged_rate,retracted_count,retracted_rate,ambiguous_count,ambiguous_rate,window_none_count,window_by_384_count,window_after_384_count,window_crosses_384_count,window_unclear_count
+P0,0,0,P0_E0_C0,0,10,0.0,0.0,0.2775327998628892,923.9,5,0,0,0.0,3,0.3,0,0.0,0,0.0,0,0.0,10,0,0,0,0
+P0,0,1,P0_E0_C1,0,10,0.0,0.0,0.2775327998628892,988.0,7,0,0,0.0,2,0.2,0,0.0,0,0.0,0,0.0,10,0,0,0,0
+P0,1,0,P0_E1_C0,3,10,0.3,0.10779126740630099,0.6032218525388546,1024.0,10,0,3,0.3,6,0.6,0,0.0,0,0.0,0,0.0,7,0,3,0,0
+P0,1,1,P0_E1_C1,3,10,0.3,0.10779126740630099,0.6032218525388546,1024.0,10,0,3,0.3,3,0.3,0,0.0,0,0.0,0,0.0,7,0,3,0,0
+P1,0,0,P1_E0_C0,0,10,0.0,0.0,0.2775327998628892,959.9,6,0,0,0.0,3,0.3,0,0.0,0,0.0,0,0.0,10,0,0,0,0
+P1,0,1,P1_E0_C1,0,10,0.0,0.0,0.2775327998628892,987.2,5,0,0,0.0,6,0.6,0,0.0,0,0.0,0,0.0,10,0,0,0,0
+P1,1,0,P1_E1_C0,4,10,0.4,0.16818032970623614,0.6873262302663417,1024.0,10,0,4,0.4,2,0.2,0,0.0,0,0.0,0,0.0,6,0,4,0,0
+P1,1,1,P1_E1_C1,5,10,0.5,0.236593090512564,0.7634069094874361,1024.0,10,0,5,0.5,1,0.1,0,0.0,0,0.0,0,0.0,5,0,5,0,0
