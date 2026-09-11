@@ -1,0 +1,29 @@
+schema_version: 1
+backend: vllm
+experiment_mode: evidence_followup_a100_awq
+model: QuantTrio/Qwen3.6-27B-AWQ
+revision: 9b507bdc9afafb87b7898700cc2a591aa6639461
+tokenizer: QuantTrio/Qwen3.6-27B-AWQ
+tokenizer_revision: 9b507bdc9afafb87b7898700cc2a591aa6639461
+quantization: awq
+quantization_metadata:
+  method: AWQ
+  bits: 4
+  group_size: 128
+  activation_order: false
+  zero_point: true
+  version: gemm
+  weight_format: safetensors
+  repository_owner: QuantTrio
+  base_model: Qwen/Qwen3.6-27B
+cpu_offload_gb: 0
+max_model_len: 8192
+max_num_seqs: 1
+gpu_memory_utilization: 0.90
+language_model_only: true
+generation_config: vllm
+seed: 0
+tensor_parallel_size: 1
+speculative_decoding: false
+prefix_caching: false
+estimated_download_bytes: 17500000000

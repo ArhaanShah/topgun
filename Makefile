@@ -4,7 +4,7 @@ RUNS_DIR ?= $(if $(PHASE_A_RUNS_DIR),$(PHASE_A_RUNS_DIR),.phase_a_runs)
 CACHE_DIR ?= $(if $(PHASE_A_CACHE_DIR),$(PHASE_A_CACHE_DIR),.phase_a_cache)
 COMMON = --profile $(PROFILE) --runs-dir $(RUNS_DIR) --cache-dir $(CACHE_DIR) --run-id $(RUN_ID)
 
-.PHONY: test check format preflight download verify-offline prepare health-check canary smoke judge-smoke reproduce judge-reproduction export-audit finalize export-run mock-e2e 2x2-prepare 2x2-run 2x2-export-audit 2x2-import-audit 2x2-analyze 2x2-recover-lock
+.PHONY: test check format preflight download verify-offline prepare health-check canary smoke judge-smoke reproduce judge-reproduction export-audit finalize export-run mock-e2e 2x2-prepare 2x2-run 2x2-export-audit 2x2-import-audit 2x2-analyze 2x2-recover-lock followup-prepare followup-run followup-status followup-export-audit followup-import-audit followup-analyze followup-export-run followup-verify-run followup-recover-lock followup-mock-e2e
 
 test:
 	python -m pytest -q
@@ -82,3 +82,39 @@ mock-e2e:
 
 2x2-recover-lock:
 	python -m phase_a.understand_2x2 recover-lock $(2X2_COMMON)
+
+# Evidence followup experiment (144-response design)
+FOLLOWUP_COMMON = $(if $(strip $(RUN_ID)),,$(error RUN_ID is required))$(if $(filter command line environment,$(origin CACHE_DIR)),,$(error CACHE_DIR must be supplied explicitly))$(if $(filter command line environment,$(origin RUNS_DIR)),,$(error RUNS_DIR must be supplied explicitly))--run-id "$(RUN_ID)" --cache-dir "$(CACHE_DIR)" --runs-dir "$(RUNS_DIR)"
+FOLLOWUP_DOWNLOAD = $(if $(filter 1,$(DOWNLOAD)),--download,)
+
+followup-prepare:
+	python -m phase_a.evidence_followup prepare $(FOLLOWUP_COMMON) $(FOLLOWUP_DOWNLOAD)
+
+followup-run:
+	python -m phase_a.evidence_followup run $(FOLLOWUP_COMMON)
+
+followup-status:
+	python -m phase_a.evidence_followup status $(FOLLOWUP_COMMON)
+
+followup-export-audit:
+	python -m phase_a.evidence_followup export-audit $(FOLLOWUP_COMMON)
+
+followup-import-audit:
+	python -m phase_a.evidence_followup import-audit $(FOLLOWUP_COMMON) --labels "$(if $(strip $(LABELS)),$(LABELS),$(error LABELS is required))"
+
+followup-analyze:
+	python -m phase_a.evidence_followup analyze $(FOLLOWUP_COMMON)
+
+followup-export-run:
+	python -m phase_a.evidence_followup export-run $(FOLLOWUP_COMMON)
+
+followup-verify-run:
+	python -m phase_a.evidence_followup verify-run $(FOLLOWUP_COMMON)
+
+followup-recover-lock:
+	python -m phase_a.evidence_followup recover-lock $(FOLLOWUP_COMMON)
+
+followup-mock-e2e:
+	python -m phase_a.evidence_followup prepare $(FOLLOWUP_COMMON) --mock
+	python -m phase_a.evidence_followup status $(FOLLOWUP_COMMON)
+
