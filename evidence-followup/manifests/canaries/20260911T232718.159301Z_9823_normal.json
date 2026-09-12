@@ -1,0 +1,1 @@
+{"completion_count":1,"completion_tokens":4,"finish_reason":"stop","kind":"normal","parameters":{"max_tokens":64,"reasoning":false,"temperature":1.0,"top_p":1.0},"prompt":"<|im_start|>user\nReply with exactly: canary pass<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n","prompt_token_count":19,"session_id":"20260911T232718.159301Z_9823","status":"PASS"}

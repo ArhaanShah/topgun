@@ -1,0 +1,1 @@
+{"captured_at":"2026-09-11T23:27:18.190246+00:00","signature":{"cuda_runtime":"13.0","gpu":[{"compute_capability":"8.0","driver_version":"580.173.02","memory_total_mib":81920,"name":"NVIDIA A100-SXM4-80GB"}],"mock":false,"packages":{"datasets":"5.0.1","torch":"2.13.0","transformers":"5.16.1","vllm":"0.29.0"},"python":"3.11.16"}}
