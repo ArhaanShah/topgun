@@ -258,8 +258,6 @@ reproduction_all_30.csv
 reproduction_true_6.csv
 .pytest_temp10
 
-understand_2x2/responses/
-understand_2x2/prompts/
 understand_2x2/private/
 understand_2x2/errors/
 understand_2x2/config-snapshot/
